@@ -1,0 +1,22 @@
+{
+  "name": "evidence-brain-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.0.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:desktop": "pnpm --filter @evidence-brain/desktop dev",
+    "dev:desktop:tauri": "pnpm --filter @evidence-brain/desktop dev:tauri",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.6.3",
+    "turbo": "^2.1.3"
+  }
+}

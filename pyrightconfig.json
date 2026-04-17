@@ -1,0 +1,39 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "include": ["services"],
+  "extraPaths": [
+    "services/brain-service/src",
+    "services/evidence-compiler/src",
+    "services/shared/knowledge-models/src",
+    "services/shared/pageindex-adapter/src"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "services/brain-service/src",
+      "extraPaths": [
+        "services/evidence-compiler/src",
+        "services/shared/knowledge-models/src",
+        "services/shared/pageindex-adapter/src"
+      ]
+    },
+    {
+      "root": "services/evidence-compiler/src",
+      "extraPaths": [
+        "services/shared/knowledge-models/src",
+        "services/shared/pageindex-adapter/src"
+      ]
+    }
+  ],
+  "reportUnknownMemberType": false,
+  "reportUnusedCallResult": false,
+  "reportMissingTypeStubs": false,
+  "reportAny": false,
+  "reportExplicitAny": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportImplicitOverride": false,
+  "reportConstantRedefinition": false,
+  "reportImplicitStringConcatenation": false
+}

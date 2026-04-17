@@ -1,0 +1,10 @@
+[tool.uv.workspace]
+members = [
+  "services/brain-service",
+  "services/evidence-compiler",
+  "services/shared/pageindex-adapter",
+  "services/shared/knowledge-models"
+]
+
+[tool.uv.sources]
+evidence-compiler = { workspace = true }

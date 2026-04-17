@@ -1,0 +1,35 @@
+# JavaScript/TypeScript
+node_modules/
+.turbo/
+dist/
+!apps/desktop/dist/.gitkeep
+*.tsbuildinfo
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# App data and local runtime
+var/dev-workspaces/*
+!var/dev-workspaces/.gitkeep
+
+third_party/*
+!third_party/README.md
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Rust/Tauri
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
