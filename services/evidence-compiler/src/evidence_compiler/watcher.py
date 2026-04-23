@@ -6,8 +6,18 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import (
+    DirCreatedEvent,
+    DirModifiedEvent,
+    FileCreatedEvent,
+    FileModifiedEvent,
+    FileSystemEvent,
+    FileSystemEventHandler,
+)
 from watchdog.observers import Observer
+
+_WatchCreateEvent = DirCreatedEvent | FileCreatedEvent
+_WatchModifyEvent = DirModifiedEvent | FileModifiedEvent
 
 
 class DebouncedHandler(FileSystemEventHandler):
@@ -17,11 +27,11 @@ class DebouncedHandler(FileSystemEventHandler):
         self, callback: Callable[[list[Path]], None], debounce_seconds: float = 2.0
     ) -> None:
         super().__init__()
-        self._callback = callback
-        self._debounce_seconds = debounce_seconds
+        self._callback: Callable[[list[Path]], None] = callback
+        self._debounce_seconds: float = debounce_seconds
         self._pending: set[Path] = set()
         self._timer: threading.Timer | None = None
-        self._lock = threading.Lock()
+        self._lock: threading.Lock = threading.Lock()
 
     def _schedule_flush(self) -> None:
         """Reset debounce timer and schedule pending path flush."""
@@ -41,22 +51,26 @@ class DebouncedHandler(FileSystemEventHandler):
         if paths:
             self._callback(paths)
 
-    def _handle(self, event) -> None:
+    def _handle(self, event: FileSystemEvent) -> None:
         """Handle one watchdog event and queue its file path if eligible."""
         if event.is_directory:
             return
-        path = Path(event.src_path)
+        src_path = event.src_path
+        if isinstance(src_path, bytes):
+            path = Path(src_path.decode("utf-8", errors="ignore"))
+        else:
+            path = Path(src_path)
         if path.name.startswith("."):
             return
         with self._lock:
             self._pending.add(path)
         self._schedule_flush()
 
-    def on_created(self, event) -> None:
+    def on_created(self, event: _WatchCreateEvent) -> None:
         """Watchdog hook for file creation events."""
         self._handle(event)
 
-    def on_modified(self, event) -> None:
+    def on_modified(self, event: _WatchModifyEvent) -> None:
         """Watchdog hook for file modification events."""
         self._handle(event)
 

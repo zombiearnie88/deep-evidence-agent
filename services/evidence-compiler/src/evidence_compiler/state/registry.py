@@ -25,7 +25,7 @@ class HashRegistry:
         Args:
             path: Path to `.brain/hashes.json`.
         """
-        self._path = path
+        self._path: Path = path
         if path.exists():
             with path.open("r", encoding="utf-8") as fh:
                 self._data: dict[str, dict[str, object]] = json.load(fh)
@@ -105,7 +105,7 @@ class JobStore:
         Args:
             jobs_dir: Directory that stores one JSON file per job.
         """
-        self._jobs_dir = jobs_dir
+        self._jobs_dir: Path = jobs_dir
         self._jobs_dir.mkdir(parents=True, exist_ok=True)
 
     def create(
