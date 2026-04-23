@@ -9,10 +9,15 @@ from evidence_compiler.api import (
     add_path,
     compile_workspace,
     find_workspace_root,
+    get_credentials_status,
+    get_provider_catalog,
     get_status,
     init_workspace,
     list_documents,
+    set_workspace_credentials,
+    validate_workspace_credentials,
 )
+from evidence_compiler.lint import run_structural_lint
 from evidence_compiler.converter import SUPPORTED_EXTENSIONS
 from evidence_compiler.watcher import watch_directory
 
@@ -48,6 +53,24 @@ def main() -> None:
     status_parser = sub.add_parser("status", help="Show workspace status")
     status_parser.add_argument("--workspace", type=Path, default=None)
 
+    credential_parser = sub.add_parser(
+        "credentials", help="Store workspace provider/model/api-key"
+    )
+    credential_parser.add_argument("--workspace", type=Path, default=None)
+    credential_parser.add_argument("--provider", type=str, required=True)
+    credential_parser.add_argument("--model", type=str, required=True)
+    credential_parser.add_argument("--api-key", type=str, required=True)
+
+    sub.add_parser("providers", help="List supported provider options")
+
+    validate_parser = sub.add_parser(
+        "validate-credentials", help="Validate workspace credentials"
+    )
+    validate_parser.add_argument("--workspace", type=Path, default=None)
+
+    lint_parser = sub.add_parser("lint", help="Run structural lint report")
+    lint_parser.add_argument("--workspace", type=Path, default=None)
+
     sub.add_parser("rebuild", help="Queue a compilation job").add_argument(
         "--workspace", type=Path, default=None
     )
@@ -65,6 +88,14 @@ def main() -> None:
         result = init_workspace(args.workspace, model=args.model)
         mode = "initialized" if result.created else "already initialized"
         print(f"{mode}: {result.workspace}")
+        return
+
+    if command == "providers":
+        options = get_provider_catalog()
+        print("Providers:")
+        for item in options:
+            models = ", ".join(item.model_examples)
+            print(f"- {item.provider_id}: {item.label} | examples={models}")
         return
 
     workspace = _resolve_workspace(getattr(args, "workspace", None))
@@ -97,14 +128,46 @@ def main() -> None:
 
         if command == "status":
             status = get_status(workspace)
+            credentials = get_credentials_status(workspace)
             print(
                 f"workspace={status.workspace}\n"
                 f"indexed_documents={status.indexed_documents}\n"
+                f"compiled_documents={status.compiled_documents}\n"
                 f"raw_files={status.raw_files}\n"
                 f"source_pages={status.source_pages}\n"
+                f"evidence_pages={status.evidence_pages}\n"
+                f"conflict_pages={status.conflict_pages}\n"
                 f"long_documents_pending_pageindex={status.long_documents_pending_pageindex}\n"
-                f"jobs queued={status.queued_jobs} completed={status.completed_jobs} failed={status.failed_jobs}"
+                f"jobs queued={status.queued_jobs} completed={status.completed_jobs} failed={status.failed_jobs}\n"
+                f"credentials provider={credentials.provider or '-'} model={credentials.model or '-'} ready={credentials.has_api_key} validated={credentials.validated}"
             )
+            return
+
+        if command == "credentials":
+            status = set_workspace_credentials(
+                workspace,
+                provider=args.provider,
+                model=args.model,
+                api_key=args.api_key,
+            )
+            print(
+                f"credentials stored provider={status.provider} model={status.model} ready={status.has_api_key}"
+            )
+            return
+
+        if command == "validate-credentials":
+            status = validate_workspace_credentials(workspace)
+            print(
+                f"credentials validated provider={status.provider} model={status.model} validated_at={status.validated_at}"
+            )
+            return
+
+        if command == "lint":
+            report = run_structural_lint(workspace)
+            report_path = workspace / "wiki" / "reports" / "lint_cli.md"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report, encoding="utf-8")
+            print(f"lint report written: {report_path}")
             return
 
         if command == "watch":

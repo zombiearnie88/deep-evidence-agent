@@ -11,6 +11,7 @@ from typing import Any
 import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "provider": "openai",
     "model": "gpt-5.4-mini",
     "language": "vi",
     "pageindex_threshold": 20,

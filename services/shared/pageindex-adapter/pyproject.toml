@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Adapter package for stable PageIndex integration"
 requires-python = ">=3.11"
 dependencies = [
-  "pydantic>=2.9.0"
+  "pydantic>=2.9.0",
+  "PyPDF2>=3.0.1"
 ]
 
 [build-system]

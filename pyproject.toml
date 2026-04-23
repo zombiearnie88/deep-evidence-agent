@@ -8,3 +8,5 @@ members = [
 
 [tool.uv.sources]
 evidence-compiler = { workspace = true }
+pageindex-adapter = { workspace = true }
+knowledge-models = { workspace = true }

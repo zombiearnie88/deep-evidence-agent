@@ -1,4 +1,4 @@
-import { UIProvider } from "@evidence-brain/ui";
+import { Button, UIProvider } from "@evidence-brain/ui";
 import { type CSSProperties, type FormEvent, useEffect, useMemo, useState } from "react";
 
 type WorkspaceItem = {
@@ -8,12 +8,17 @@ type WorkspaceItem = {
   initialized: boolean;
   status?: {
     indexed_documents: number;
+    compiled_documents: number;
     raw_files: number;
     source_pages: number;
+    evidence_pages: number;
+    conflict_pages: number;
     queued_jobs: number;
     completed_jobs: number;
     failed_jobs: number;
+    credentials_ready: boolean;
   } | null;
+  credentials?: CredentialStatus | null;
 };
 
 type DocumentItem = {
@@ -41,6 +46,26 @@ type DocumentsResponse = {
 type CompileResponse = {
   job_id: string | null;
   processed_files: number;
+  created_pages: number;
+};
+
+type ProviderItem = {
+  provider_id: string;
+  label: string;
+  description: string;
+  model_examples: string[];
+};
+
+type ProvidersResponse = {
+  items: ProviderItem[];
+};
+
+type CredentialStatus = {
+  provider: string | null;
+  model: string | null;
+  has_api_key: boolean;
+  validated: boolean;
+  validated_at: string | null;
 };
 
 const surfaceStyle: CSSProperties = {
@@ -49,23 +74,6 @@ const surfaceStyle: CSSProperties = {
   padding: 16,
   background: "rgba(255, 255, 255, 0.92)",
   boxShadow: "0 8px 24px rgba(8, 30, 52, 0.08)",
-};
-
-const buttonStyle: CSSProperties = {
-  border: "1px solid #123a5b",
-  borderRadius: 10,
-  background: "#123a5b",
-  color: "#ffffff",
-  padding: "8px 12px",
-  fontWeight: 600,
-  cursor: "pointer",
-};
-
-const mutedButtonStyle: CSSProperties = {
-  ...buttonStyle,
-  borderColor: "#bcc7d3",
-  background: "#f2f5f8",
-  color: "#213547",
 };
 
 export function AppShell() {
@@ -80,6 +88,11 @@ export function AppShell() {
   const [selectedWorkspace, setSelectedWorkspace] = useState<string>("");
   const [sourcePath, setSourcePath] = useState<string>("");
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [providers, setProviders] = useState<ProviderItem[]>([]);
+  const [provider, setProvider] = useState<string>("openai");
+  const [model, setModel] = useState<string>("gpt-5.4-mini");
+  const [apiKey, setApiKey] = useState<string>("");
+  const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
   const [actionInfo, setActionInfo] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
@@ -116,9 +129,55 @@ export function AppShell() {
     }
   };
 
+  const loadProviders = async () => {
+    try {
+      const response = await fetch(`${apiBase}/providers`);
+      if (!response.ok) {
+        throw new Error(`providers request failed: ${response.status}`);
+      }
+      const payload = (await response.json()) as ProvidersResponse;
+      setProviders(payload.items);
+      if (payload.items.length > 0) {
+        const active = payload.items.find((item) => item.provider_id === provider) ?? payload.items[0];
+        setProvider(active.provider_id);
+        if (active.model_examples.length > 0) {
+          setModel(active.model_examples[0]);
+        }
+      }
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+    }
+  };
+
   useEffect(() => {
     void loadOverview();
+    void loadProviders();
   }, [apiBase]);
+
+  const loadCredentialStatus = async (workspaceRef: string) => {
+    if (!workspaceRef) {
+      setCredentialStatus(null);
+      return;
+    }
+    try {
+      const response = await fetch(`${apiBase}/workspaces/${encodeURIComponent(workspaceRef)}/credentials/status`);
+      if (!response.ok) {
+        throw new Error(`credentials status failed: ${response.status}`);
+      }
+      const payload = (await response.json()) as CredentialStatus;
+      setCredentialStatus(payload);
+      if (payload.provider) {
+        setProvider(payload.provider);
+      }
+      if (payload.model) {
+        setModel(payload.model);
+      }
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+    }
+  };
 
   const loadDocuments = async (workspaceRef: string) => {
     if (!workspaceRef) {
@@ -146,7 +205,72 @@ export function AppShell() {
       return;
     }
     void loadDocuments(selectedWorkspace);
+    void loadCredentialStatus(selectedWorkspace);
   }, [apiBase, selectedWorkspace]);
+
+  const onSaveCredentials = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedWorkspace || !provider || !model || !apiKey.trim()) {
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(
+        `${apiBase}/workspaces/${encodeURIComponent(selectedWorkspace)}/credentials`,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            provider,
+            model,
+            api_key: apiKey.trim(),
+          }),
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`save credentials failed: ${response.status}`);
+      }
+      setApiKey("");
+      setActionInfo(`credentials stored for ${provider}/${model}`);
+      await loadCredentialStatus(selectedWorkspace);
+      await loadOverview();
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onValidateCredentials = async () => {
+    if (!selectedWorkspace) {
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(
+        `${apiBase}/workspaces/${encodeURIComponent(selectedWorkspace)}/credentials/validate`,
+        {
+          method: "POST",
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`validate credentials failed: ${response.status}`);
+      }
+      setActionInfo("credentials validated");
+      await loadCredentialStatus(selectedWorkspace);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const onCreateWorkspace = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -235,13 +359,17 @@ export function AppShell() {
         body: JSON.stringify({ workspace: selectedWorkspace }),
       });
       if (!response.ok) {
+        if (response.status === 409) {
+          throw new Error("missing workspace credentials; save and validate key first");
+        }
         throw new Error(`queue compile failed: ${response.status}`);
       }
       const payload = (await response.json()) as CompileResponse;
       setActionInfo(
-        `compile queued: job=${payload.job_id ?? "n/a"}, docs=${payload.processed_files}`,
+        `compile done: job=${payload.job_id ?? "n/a"}, docs=${payload.processed_files}, pages=${payload.created_pages}`,
       );
       await loadOverview();
+      await loadDocuments(selectedWorkspace);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
@@ -309,19 +437,19 @@ export function AppShell() {
                   fontSize: 14,
                 }}
               />
-              <button type="submit" style={buttonStyle} disabled={busy}>
+              <Button type="submit" disabled={busy}>
                 Create Workspace
-              </button>
-              <button
+              </Button>
+              <Button
                 type="button"
-                style={mutedButtonStyle}
+                variant="secondary"
                 disabled={busy}
                 onClick={() => {
                   void loadOverview();
                 }}
               >
                 Refresh
-              </button>
+              </Button>
             </form>
 
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -361,23 +489,79 @@ export function AppShell() {
                   fontSize: 14,
                 }}
               />
-              <button
+              <Button
                 type="submit"
-                style={buttonStyle}
                 disabled={busy || !selectedWorkspace}
               >
                 Ingest Source
-              </button>
-              <button
+              </Button>
+              <Button
                 type="button"
-                style={mutedButtonStyle}
+                variant="secondary"
                 disabled={busy || !selectedWorkspace}
                 onClick={() => {
                   void onQueueCompile();
                 }}
               >
                 Queue Compile
-              </button>
+              </Button>
+            </form>
+
+            <form onSubmit={onSaveCredentials} style={{ display: "grid", gap: 8 }}>
+              <div style={{ display: "grid", gap: 8, gridTemplateColumns: "180px 1fr 1fr" }}>
+                <select
+                  value={provider}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setProvider(value);
+                    const found = providers.find((item) => item.provider_id === value);
+                    if (found && found.model_examples.length > 0) {
+                      setModel(found.model_examples[0]);
+                    }
+                  }}
+                  style={{ border: "1px solid #ccd5df", borderRadius: 10, padding: "8px 10px" }}
+                >
+                  {providers.map((item) => (
+                    <option key={item.provider_id} value={item.provider_id}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  value={model}
+                  onChange={(event) => setModel(event.target.value)}
+                  placeholder="model name"
+                  style={{ border: "1px solid #ccd5df", borderRadius: 10, padding: "8px 10px" }}
+                />
+                <input
+                  value={apiKey}
+                  onChange={(event) => setApiKey(event.target.value)}
+                  placeholder="api key"
+                  type="password"
+                  style={{ border: "1px solid #ccd5df", borderRadius: 10, padding: "8px 10px" }}
+                />
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button
+                  type="submit"
+                  disabled={busy || !selectedWorkspace || !provider || !model || !apiKey.trim()}
+                >
+                  Save Credentials
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={busy || !selectedWorkspace || !credentialStatus?.has_api_key}
+                  onClick={() => {
+                    void onValidateCredentials();
+                  }}
+                >
+                  Validate
+                </Button>
+                <span style={{ alignSelf: "center" }}>
+                  credentials: {credentialStatus?.has_api_key ? "saved" : "missing"}, validated: {credentialStatus?.validated ? "yes" : "no"}
+                </span>
+              </div>
             </form>
 
             {actionInfo ? (
@@ -447,7 +631,9 @@ export function AppShell() {
                     <small>
                       docs={workspace.status.indexed_documents}, raw=
                       {workspace.status.raw_files}, sources=
-                      {workspace.status.source_pages}, jobs(queued/completed/failed)=
+                      {workspace.status.source_pages}, compiled={workspace.status.compiled_documents}, evidence=
+                      {workspace.status.evidence_pages}, conflicts={workspace.status.conflict_pages}, credentials=
+                      {workspace.status.credentials_ready ? "ready" : "missing"}, jobs(queued/completed/failed)=
                       {workspace.status.queued_jobs}/{workspace.status.completed_jobs}/
                       {workspace.status.failed_jobs}
                     </small>

@@ -5,13 +5,17 @@ description = "Library-first compiler for Evidence Brain wiki artifacts"
 requires-python = ">=3.11"
 dependencies = [
   "litellm>=1.70.0",
+  "pydantic>=2.9.0",
+  "knowledge-models",
   "python-dotenv>=1.0.1",
   "pyyaml>=6.0.2",
   "json-repair>=0.35.0",
+  "keyring>=25.6.0",
   "watchdog>=5.0.3",
   "markitdown[all]>=0.1.1",
   "pymupdf>=1.24.10",
-  "PyPDF2>=3.0.1"
+  "PyPDF2>=3.0.1",
+  "pageindex-adapter"
 ]
 
 [project.scripts]

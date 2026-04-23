@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -47,11 +46,7 @@ class HashRegistry:
         Args:
             document: Document metadata to persist.
         """
-        payload = asdict(document)
-        payload["raw_path"] = str(document.raw_path)
-        payload["source_path"] = (
-            str(document.source_path) if document.source_path else None
-        )
+        payload = document.model_dump(mode="json")
         self._data[document.file_hash] = payload
         self._persist()
 
@@ -59,32 +54,30 @@ class HashRegistry:
         """Deserialize and return all documents sorted by creation timestamp."""
         documents: list[DocumentRecord] = []
         for payload in self._data.values():
-            documents.append(
-                DocumentRecord(
-                    doc_id=str(payload["doc_id"]),
-                    name=str(payload["name"]),
-                    file_hash=str(payload["file_hash"]),
-                    file_type=str(payload["file_type"]),
-                    raw_path=Path(str(payload["raw_path"])),
-                    source_path=Path(str(payload["source_path"]))
-                    if payload.get("source_path")
-                    else None,
-                    is_long_doc=bool(payload["is_long_doc"]),
-                    requires_pageindex=bool(payload["requires_pageindex"]),
-                    page_count=int(payload["page_count"])
-                    if payload.get("page_count") is not None
-                    else None,
-                    status=str(payload["status"]),
-                    created_at=str(payload["created_at"]),
-                )
-            )
+            documents.append(DocumentRecord.model_validate(payload))
         return sorted(documents, key=lambda d: d.created_at)
+
+    def update_document(self, file_hash: str, **fields: object) -> None:
+        """Update one existing document entry and persist changes."""
+        current = self._data.get(file_hash)
+        if not current:
+            return
+        updated = dict(current)
+        for key, value in fields.items():
+            if isinstance(value, Path):
+                updated[key] = str(value)
+            else:
+                updated[key] = value
+        self._data[file_hash] = updated
+        self._persist()
 
     def _persist(self) -> None:
         """Write registry state to disk as JSON."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("w", encoding="utf-8") as fh:
+        tmp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
             json.dump(self._data, fh, indent=2)
+        tmp_path.replace(self._path)
 
     @staticmethod
     def hash_file(path: Path) -> str:
@@ -156,6 +149,35 @@ class JobStore:
         self._write(job)
         return job
 
+    def update(
+        self,
+        job_id: str,
+        *,
+        status: str | None = None,
+        stage: str | None = None,
+        progress: float | None = None,
+        message: str | None = None,
+        error: str | None = None,
+        payload: dict[str, object] | None = None,
+    ) -> JobRecord:
+        """Update selected fields for an existing job."""
+        job = self.read(job_id)
+        if status is not None:
+            job.status = status
+        if stage is not None:
+            job.stage = stage
+        if progress is not None:
+            job.progress = progress
+        if message is not None:
+            job.message = message
+        if error is not None:
+            job.error = error
+        if payload is not None:
+            job.payload = payload
+        job.updated_at = now_iso()
+        self._write(job)
+        return job
+
     def read(self, job_id: str) -> JobRecord:
         """Read one job by id.
 
@@ -168,7 +190,7 @@ class JobStore:
         path = self._jobs_dir / f"{job_id}.json"
         with path.open("r", encoding="utf-8") as fh:
             payload = json.load(fh)
-        return JobRecord(**payload)
+        return JobRecord.model_validate(payload)
 
     def list_jobs(self) -> list[JobRecord]:
         """Return all jobs sorted by creation timestamp."""
@@ -176,11 +198,13 @@ class JobStore:
         for path in sorted(self._jobs_dir.glob("*.json")):
             with path.open("r", encoding="utf-8") as fh:
                 payload = json.load(fh)
-            jobs.append(JobRecord(**payload))
+            jobs.append(JobRecord.model_validate(payload))
         return sorted(jobs, key=lambda job: job.created_at)
 
     def _write(self, job: JobRecord) -> None:
         """Persist one job record to disk."""
         path = self._jobs_dir / f"{job.job_id}.json"
-        with path.open("w", encoding="utf-8") as fh:
-            json.dump(asdict(job), fh, indent=2)
+        tmp_path = path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(job.model_dump(mode="json"), fh, indent=2)
+        tmp_path.replace(path)

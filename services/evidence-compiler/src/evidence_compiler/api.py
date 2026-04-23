@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from evidence_compiler.compiler import compile_documents, rebuild_index
 from evidence_compiler.config import DEFAULT_CONFIG, load_config, save_config
 from evidence_compiler.converter import SUPPORTED_EXTENSIONS, convert_document
+from evidence_compiler.credentials import (
+    get_workspace_credential_status,
+    resolve_workspace_credentials,
+    save_workspace_credentials,
+    validate_credentials,
+)
+from evidence_compiler.lint import run_structural_lint
 from evidence_compiler.models import (
     AddResult,
     CompileResult,
+    CredentialStatus,
     DocumentRecord,
+    ProviderOption,
     WorkspaceInitResult,
     WorkspaceStatus,
 )
+from evidence_compiler.providers import list_provider_options, normalize_provider
 from evidence_compiler.schema.workspace import (
     AGENTS_MD,
     WORKSPACE_DIRS,
@@ -22,6 +34,10 @@ from evidence_compiler.schema.workspace import (
     required_markers,
 )
 from evidence_compiler.state import HashRegistry, JobStore, now_iso
+
+
+class MissingCredentialsError(ValueError):
+    """Raised when workspace credential bundle is missing or incomplete."""
 
 
 def _resolve_workspace(path: Path) -> Path:
@@ -51,12 +67,19 @@ def find_workspace_root(start: Path) -> Path | None:
     """
     current = start.resolve()
     while True:
-        markers = required_markers(current)
-        if all(path.exists() for path in markers):
+        if all(path.exists() for path in required_markers(current)):
             return current
         if current.parent == current:
             return None
         current = current.parent
+
+
+def _append_log(workspace: Path, operation: str, description: str) -> None:
+    """Append one operation entry to `wiki/log.md`."""
+    log_path = workspace / "wiki" / "log.md"
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"## [{timestamp}] {operation} | {description}\n\n")
 
 
 def init_workspace(workspace: Path, model: str | None = None) -> WorkspaceInitResult:
@@ -85,7 +108,6 @@ def init_workspace(workspace: Path, model: str | None = None) -> WorkspaceInitRe
     hashes_path = workspace / ".brain" / "hashes.json"
 
     already_initialized = config_path.exists() and hashes_path.exists()
-
     for relative in WORKSPACE_DIRS:
         (workspace / relative).mkdir(parents=True, exist_ok=True)
 
@@ -121,16 +143,6 @@ def _discover_files(path: Path) -> list[Path]:
     if path.is_dir():
         return sorted(item for item in path.rglob("*") if item.is_file())
     return []
-
-
-def _append_log(workspace: Path, operation: str, description: str) -> None:
-    """Append one operation entry to `wiki/log.md`."""
-    log_path = workspace / "wiki" / "log.md"
-    from datetime import UTC, datetime
-
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    with log_path.open("a", encoding="utf-8") as fh:
-        fh.write(f"## [{timestamp}] {operation} | {description}\n\n")
 
 
 def add_path(workspace: Path, path: Path) -> AddResult:
@@ -247,11 +259,60 @@ def list_documents(workspace: Path) -> list[DocumentRecord]:
     return registry.list_documents()
 
 
+def get_provider_catalog() -> list[ProviderOption]:
+    """Return provider choices for credential setup UI."""
+    return list_provider_options()
+
+
+def get_credentials_status(workspace: Path) -> CredentialStatus:
+    """Return workspace credential status."""
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    return get_workspace_credential_status(workspace)
+
+
+def set_workspace_credentials(
+    workspace: Path,
+    *,
+    provider: str,
+    model: str,
+    api_key: str,
+) -> CredentialStatus:
+    """Store provider/model/api_key for one workspace."""
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    provider_id = normalize_provider(provider)
+    return save_workspace_credentials(
+        workspace,
+        provider=provider_id,
+        model=model,
+        api_key=api_key,
+        validated=False,
+        validated_at=None,
+    )
+
+
+def validate_workspace_credentials(workspace: Path) -> CredentialStatus:
+    """Validate current workspace credential bundle with a tiny LiteLLM call."""
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    provider, model, api_key = resolve_workspace_credentials(workspace)
+    validate_credentials(provider=provider, model=model, api_key=api_key)
+    return save_workspace_credentials(
+        workspace,
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        validated=True,
+        validated_at=now_iso(),
+    )
+
+
 def get_status(workspace: Path) -> WorkspaceStatus:
     """Compute high-level workspace status for UI/API consumption.
 
-    Includes counts for indexed docs, raw/source artifacts, pending long-doc
-    PageIndex work, and queued/completed/failed jobs.
+    Includes counts for indexed docs, raw/source artifacts, compile outputs,
+    pending long-doc PageIndex work, and queued/completed/failed jobs.
 
     Args:
         workspace: Initialized workspace root.
@@ -267,6 +328,7 @@ def get_status(workspace: Path) -> WorkspaceStatus:
 
     documents = list_documents(workspace)
     jobs = JobStore(workspace / ".brain" / "jobs").list_jobs()
+    credential_status = get_workspace_credential_status(workspace)
 
     queued_jobs = sum(1 for job in jobs if job.status == "queued")
     completed_jobs = sum(1 for job in jobs if job.status == "completed")
@@ -283,6 +345,11 @@ def get_status(workspace: Path) -> WorkspaceStatus:
         ]
     )
     long_pending = sum(1 for document in documents if document.requires_pageindex)
+    compiled_documents = sum(
+        1 for document in documents if document.status == "compiled"
+    )
+    evidence_pages = len(list((workspace / "wiki" / "evidence").glob("*.md")))
+    conflict_pages = len(list((workspace / "wiki" / "conflicts").glob("*.md")))
 
     return WorkspaceStatus(
         workspace=workspace,
@@ -293,41 +360,181 @@ def get_status(workspace: Path) -> WorkspaceStatus:
         queued_jobs=queued_jobs,
         completed_jobs=completed_jobs,
         failed_jobs=failed_jobs,
+        compiled_documents=compiled_documents,
+        evidence_pages=evidence_pages,
+        conflict_pages=conflict_pages,
+        credentials_ready=credential_status.has_api_key,
     )
 
 
 def compile_workspace(workspace: Path) -> CompileResult:
-    """Queue a compilation job for current workspace documents.
+    """Compile indexed documents into wiki taxonomy pages and lint report.
 
-    Milestone A behavior is intentionally minimal: this function records a
-    placeholder compile job and logs the operation, without producing final wiki
-    synthesis pages yet.
+    This is the Milestone 2 compile pipeline. It requires workspace credentials,
+    runs extraction/synthesis, rebuilds `wiki/index.md`, emits structural lint,
+    and updates per-document compile status plus compile job progress metadata.
 
     Args:
         workspace: Initialized workspace root.
 
     Returns:
-        CompileResult with processed-file count and queued job id.
+        CompileResult with processed-document count, created page count, and job id.
 
     Raises:
-        ValueError: If workspace is not initialized.
+        ValueError: If workspace is not initialized or has no indexed documents.
+        MissingCredentialsError: If provider/model/api-key bundle is missing.
+    """
+    return run_compile_job(workspace, job_id=None)
+
+
+def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
+    """Run compile pipeline using an existing or newly-created job record.
+
+    Args:
+        workspace: Initialized workspace root.
+        job_id: Existing compile job id to reuse, or `None` to create a new job.
+
+    Returns:
+        CompileResult with processed-document count, created page count, and job id.
+
+    Raises:
+        ValueError: If workspace is not initialized or has no indexed documents.
+        MissingCredentialsError: If provider/model/api-key bundle is missing.
     """
     workspace = _resolve_workspace(workspace)
     _assert_workspace_initialized(workspace)
+
     documents = list_documents(workspace)
+    if not documents:
+        raise ValueError("No indexed documents found")
+
+    try:
+        provider, model, api_key = resolve_workspace_credentials(workspace)
+    except ValueError as error:
+        raise MissingCredentialsError(str(error)) from error
+
+    config = load_config(workspace / ".brain" / "config.yaml")
     jobs = JobStore(workspace / ".brain" / "jobs")
 
-    payload: dict[str, object] = {
-        "document_hashes": [document.file_hash for document in documents],
-        "document_count": len(documents),
-        "note": "Compilation pipeline placeholder for Milestone A",
+    stage_progress: dict[str, float] = {
+        "preparing": 0.05,
+        "indexing-long-docs": 0.12,
+        "summarizing": 0.24,
+        "planning-taxonomy": 0.36,
+        "writing-topics": 0.5,
+        "writing-regulations": 0.62,
+        "writing-procedures": 0.72,
+        "writing-conflicts": 0.82,
+        "writing-evidence": 0.9,
+        "backlinking": 0.94,
+        "updating-index": 0.97,
+        "linting": 0.99,
+        "completed": 1.0,
     }
-    job = jobs.create(kind="compile", payload=payload, status="queued")
-    _append_log(workspace, "compile", f"job={job.job_id} docs={len(documents)}")
 
-    return CompileResult(
-        workspace=workspace,
-        processed_files=len(documents),
-        created_pages=0,
-        job_id=job.job_id,
-    )
+    def _set_stage(stage: str, message: str) -> None:
+        jobs.update(
+            job.job_id,
+            stage=stage,
+            progress=stage_progress.get(stage, 0.5),
+            message=message,
+        )
+
+    if job_id is None:
+        job = jobs.create(
+            kind="compile",
+            status="running",
+            payload={
+                "document_hashes": [document.file_hash for document in documents],
+                "document_count": len(documents),
+                "provider": provider,
+                "model": model,
+            },
+        )
+        _set_stage("preparing", "Preparing compile pipeline")
+    else:
+        job = jobs.update(
+            job_id,
+            status="running",
+            stage="preparing",
+            progress=stage_progress["preparing"],
+            message="Preparing compile pipeline",
+            payload={
+                "document_hashes": [document.file_hash for document in documents],
+                "document_count": len(documents),
+                "provider": provider,
+                "model": model,
+            },
+        )
+
+    registry = HashRegistry(workspace / ".brain" / "hashes.json")
+
+    try:
+        artifacts = compile_documents(
+            workspace,
+            documents,
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            language=str(config.get("language", DEFAULT_CONFIG["language"])),
+            stage_callback=_set_stage,
+        )
+
+        _set_stage("updating-index", "Updating wiki index")
+        rebuild_index(workspace, artifacts)
+
+        _set_stage("linting", "Running structural lint checks")
+        lint_report = run_structural_lint(workspace)
+        lint_path = (
+            workspace
+            / "wiki"
+            / "reports"
+            / f"lint_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.md"
+        )
+        lint_path.parent.mkdir(parents=True, exist_ok=True)
+        lint_path.write_text(lint_report, encoding="utf-8")
+
+        for document in documents:
+            updates: dict[str, object] = {
+                "status": "compiled",
+                "requires_pageindex": False,
+            }
+            artifact_path = artifacts.pageindex_artifacts.get(document.file_hash)
+            if artifact_path:
+                updates["pageindex_artifact_path"] = artifact_path
+            registry.update_document(document.file_hash, **updates)
+
+        jobs.update(
+            job.job_id,
+            status="completed",
+            stage="completed",
+            progress=1.0,
+            message="Compilation completed",
+            payload={
+                **job.payload,
+                "created_pages": artifacts.total_pages,
+                "lint_report": str(lint_path),
+            },
+        )
+
+        _append_log(
+            workspace,
+            "compile",
+            f"job={job.job_id} docs={len(documents)} pages={artifacts.total_pages}",
+        )
+        return CompileResult(
+            workspace=workspace,
+            processed_files=len(documents),
+            created_pages=artifacts.total_pages,
+            job_id=job.job_id,
+        )
+    except Exception as error:
+        jobs.update(
+            job.job_id,
+            status="failed",
+            stage="failed",
+            progress=1.0,
+            error=str(error),
+            message="Compilation failed",
+        )
+        raise
