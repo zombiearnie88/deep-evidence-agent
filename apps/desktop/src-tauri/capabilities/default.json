@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capabilities for Evidence Brain desktop shell",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }

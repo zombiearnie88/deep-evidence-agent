@@ -68,6 +68,19 @@ type CredentialStatus = {
   validated_at: string | null;
 };
 
+export type ImportSelectionMode = "files" | "folder";
+
+export type AppShellProps = {
+  pickImportPaths?: (mode: ImportSelectionMode) => Promise<string[]>;
+};
+
+type IngestResponse = {
+  discovered_files: number;
+  added_documents: DocumentItem[];
+  skipped_files: string[];
+  unsupported_files: string[];
+};
+
 const surfaceStyle: CSSProperties = {
   border: "1px solid #d7dce3",
   borderRadius: 14,
@@ -76,7 +89,7 @@ const surfaceStyle: CSSProperties = {
   boxShadow: "0 8px 24px rgba(8, 30, 52, 0.08)",
 };
 
-export function AppShell() {
+export function AppShell({ pickImportPaths }: AppShellProps = {}) {
   const apiBase = useMemo(() => {
     const runtimeConfig = globalThis as { __EVIDENCE_BRAIN_SERVICE_URL__?: string };
     return runtimeConfig.__EVIDENCE_BRAIN_SERVICE_URL__ ?? "http://127.0.0.1:8787";
@@ -301,6 +314,23 @@ export function AppShell() {
     }
   };
 
+  const ingestSourcePath = async (path: string): Promise<IngestResponse> => {
+    const response = await fetch(`${apiBase}/documents/ingest`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace: selectedWorkspace,
+        path,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`ingest failed: ${response.status}`);
+    }
+    return (await response.json()) as IngestResponse;
+  };
+
   const onIngestSource = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!selectedWorkspace || !sourcePath.trim()) {
@@ -311,26 +341,58 @@ export function AppShell() {
     setError("");
     setActionInfo("");
     try {
-      const response = await fetch(`${apiBase}/documents/ingest`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          workspace: selectedWorkspace,
-          path: sourcePath.trim(),
-        }),
-      });
-      if (!response.ok) {
-        throw new Error(`ingest failed: ${response.status}`);
+      const payload = await ingestSourcePath(sourcePath.trim());
+      setActionInfo(
+        `ingest done: discovered=${payload.discovered_files}, added=${payload.added_documents.length}, skipped=${payload.skipped_files.length}, unsupported=${payload.unsupported_files.length}`,
+      );
+      await loadOverview();
+      await loadDocuments(selectedWorkspace);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onImportSelection = async (mode: ImportSelectionMode) => {
+    if (!selectedWorkspace || !pickImportPaths) {
+      return;
+    }
+
+    let picked: string[];
+    try {
+      picked = await pickImportPaths(mode);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+      return;
+    }
+    const uniquePaths = Array.from(new Set(picked.map((path) => path.trim()).filter(Boolean)));
+    if (uniquePaths.length === 0) {
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    setActionInfo("");
+    try {
+      let discovered = 0;
+      let added = 0;
+      let skipped = 0;
+      let unsupported = 0;
+
+      for (const path of uniquePaths) {
+        const payload = await ingestSourcePath(path);
+        discovered += payload.discovered_files;
+        added += payload.added_documents.length;
+        skipped += payload.skipped_files.length;
+        unsupported += payload.unsupported_files.length;
       }
 
-      const payload = (await response.json()) as {
-        discovered_files: number;
-        added_documents: DocumentItem[];
-      };
+      setSourcePath(uniquePaths[0]);
       setActionInfo(
-        `ingest done: discovered=${payload.discovered_files}, added=${payload.added_documents.length}`,
+        `ingest done: sources=${uniquePaths.length}, discovered=${discovered}, added=${added}, skipped=${skipped}, unsupported=${unsupported}`,
       );
       await loadOverview();
       await loadDocuments(selectedWorkspace);
@@ -506,6 +568,31 @@ export function AppShell() {
                 Queue Compile
               </Button>
             </form>
+
+            {pickImportPaths ? (
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={busy || !selectedWorkspace}
+                  onClick={() => {
+                    void onImportSelection("files");
+                  }}
+                >
+                  Import Files
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={busy || !selectedWorkspace}
+                  onClick={() => {
+                    void onImportSelection("folder");
+                  }}
+                >
+                  Import Folder
+                </Button>
+              </div>
+            ) : null}
 
             <form onSubmit={onSaveCredentials} style={{ display: "grid", gap: 8 }}>
               <div style={{ display: "grid", gap: 8, gridTemplateColumns: "180px 1fr 1fr" }}>
