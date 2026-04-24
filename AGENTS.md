@@ -72,6 +72,7 @@ This file stores persistent implementation conventions for future coding session
 ## 5) Quality Gate Before Finishing
 
 - Run Python integration tests relevant to changed API/compiler paths.
+- Run Python typecheck with `npx basedpyright` when Python service/compiler code changes.
 - Run TypeScript typecheck for app/desktop when API JSON contracts change.
 - If API response shapes change, ensure UI model types are updated in
   `packages/app/src/pages/app-shell.tsx`.
@@ -99,3 +100,5 @@ This file stores persistent implementation conventions for future coding session
 - `2026-04-23`: Drafting-stage concurrency should stay scoped to post-plan page
   drafting only, and pipeline reviewability should win over splitting logic into
   many tiny single-use helpers.
+- `2026-04-24`: Quality gate now includes `npx basedpyright` for Python-side
+  changes so compile/service refactors get a static typecheck before finishing.

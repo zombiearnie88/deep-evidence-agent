@@ -22,8 +22,19 @@ from pydantic import BaseModel, Field, ValidationError
 
 from evidence_compiler.credentials import provider_env
 from evidence_compiler.models import DocumentRecord
+from knowledge_models.compiler_api import (
+    CompilePlanBucket,
+    CompilePlanDocument,
+    CompilePlanItem as CompilePlanPreviewItem,
+    CompilePlanSummary,
+    TokenUsageSummary,
+)
 
 StageCallback = Callable[[str, str], None]
+CounterCallback = Callable[[str, int, int, str, str | None], None]
+PlanCallback = Callable[[CompilePlanSummary], None]
+UsageCallback = Callable[[str, TokenUsageSummary], None]
+UsageDeltaCallback = Callable[[TokenUsageSummary], None]
 ModelT = TypeVar("ModelT", bound=BaseModel)
 RenderModelT = TypeVar("RenderModelT", bound=BaseModel)
 DraftModelT = TypeVar("DraftModelT", bound=BaseModel, covariant=True)
@@ -40,6 +51,7 @@ class DraftCreateUpdateFn(Protocol[DraftModelT]):
         item: PagePlanItem,
         is_update: bool,
         existing_body: str,
+        usage_callback: UsageDeltaCallback | None = None,
     ) -> Awaitable[DraftModelT]: ...
 
 
@@ -188,6 +200,7 @@ _STOPWORDS = {
 _DRAFT_CONCURRENCY = 5
 _MARKDOWN_LINE_WIDTH = 88
 _TAXONOMY_PLAN_MAX_TOKENS = 1536
+_PLAN_PREVIEW_LIMIT = 10
 
 _TOPIC_BODY_GUIDANCE = (
     "Write explanatory synthesis for a stable subject page. Define what the topic "
@@ -299,6 +312,33 @@ def _emit_stage(callback: StageCallback | None, stage: str, message: str) -> Non
         callback(stage, message)
 
 
+def _emit_counter(
+    callback: CounterCallback | None,
+    stage: str,
+    completed: int,
+    total: int,
+    unit: str,
+    item_label: str | None = None,
+) -> None:
+    if callback is not None:
+        callback(stage, completed, total, unit, item_label)
+
+
+def _emit_plan(
+    callback: PlanCallback | None, plan_summary: CompilePlanSummary
+) -> None:
+    if callback is not None:
+        callback(plan_summary)
+
+
+def _stage_usage_reporter(
+    callback: UsageCallback | None, stage: str
+) -> UsageDeltaCallback | None:
+    if callback is None:
+        return None
+    return lambda usage: callback(stage, usage)
+
+
 def _slugify(value: str) -> str:
     normalized = (
         unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
@@ -365,12 +405,43 @@ def _extract_completion_content(response: object) -> str:
     return json.dumps(content, ensure_ascii=False)
 
 
+def _usage_field(payload: object, key: str) -> object | None:
+    if isinstance(payload, dict):
+        return payload.get(key)
+    return getattr(payload, key, None)
+
+
+def _extract_usage(response: object) -> TokenUsageSummary:
+    usage = _usage_field(response, "usage")
+    if usage is None:
+        return TokenUsageSummary(calls=1, available=False)
+
+    prompt_tokens_raw = _usage_field(usage, "prompt_tokens")
+    completion_tokens_raw = _usage_field(usage, "completion_tokens")
+    total_tokens_raw = _usage_field(usage, "total_tokens")
+    prompt_tokens = _to_int(prompt_tokens_raw)
+    completion_tokens = _to_int(completion_tokens_raw)
+    total_tokens = _to_int(total_tokens_raw, prompt_tokens + completion_tokens)
+    available = any(
+        value is not None
+        for value in [prompt_tokens_raw, completion_tokens_raw, total_tokens_raw]
+    )
+    return TokenUsageSummary(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        calls=1,
+        available=available,
+    )
+
+
 def _structured_completion(
     *,
     model: str,
     messages: list[dict[str, str]],
     response_model: type[ModelT],
     max_tokens: int | None = None,
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> ModelT:
     try:
         if max_tokens is None:
@@ -388,6 +459,8 @@ def _structured_completion(
                 response_format=response_model,
                 max_tokens=max_tokens,
             )
+        if usage_callback is not None:
+            usage_callback(_extract_usage(response))
         content = _extract_completion_content(response)
         return response_model.model_validate_json(content)
     except Exception:
@@ -404,6 +477,8 @@ def _structured_completion(
                 temperature=0,
                 max_tokens=max_tokens,
             )
+        if usage_callback is not None:
+            usage_callback(_extract_usage(response))
         content = _extract_completion_content(response)
         payload = _safe_json(content)
         return response_model.model_validate(payload)
@@ -415,6 +490,7 @@ async def _structured_acompletion(
     messages: list[dict[str, str]],
     response_model: type[ModelT],
     max_tokens: int | None = None,
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> ModelT:
     try:
         if max_tokens is None:
@@ -432,6 +508,8 @@ async def _structured_acompletion(
                 response_format=response_model,
                 max_tokens=max_tokens,
             )
+        if usage_callback is not None:
+            usage_callback(_extract_usage(response))
         content = _extract_completion_content(response)
         return response_model.model_validate_json(content)
     except Exception:
@@ -448,6 +526,8 @@ async def _structured_acompletion(
                 temperature=0,
                 max_tokens=max_tokens,
             )
+        if usage_callback is not None:
+            usage_callback(_extract_usage(response))
         content = _extract_completion_content(response)
         payload = _safe_json(content)
         return response_model.model_validate(payload)
@@ -761,7 +841,11 @@ def _summary_messages(doc_name: str, text: str, language: str) -> list[dict[str,
 
 
 def _summarize_document(
-    *, model: str, language: str, materialized: _MaterializedDocument
+    *,
+    model: str,
+    language: str,
+    materialized: _MaterializedDocument,
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> SummaryStageResult:
     return _structured_completion(
         model=model,
@@ -771,6 +855,7 @@ def _summarize_document(
             language=language,
         ),
         response_model=SummaryStageResult,
+        usage_callback=usage_callback,
     )
 
 
@@ -1103,6 +1188,7 @@ def _plan_taxonomy(
     materialized: _MaterializedDocument,
     summary: SummaryStageResult,
     existing_briefs: dict[str, dict[str, str]],
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> TaxonomyPlanResult:
     """Build taxonomy actions for one summary while avoiding duplicate slugs."""
     plan = _structured_completion(
@@ -1115,12 +1201,96 @@ def _plan_taxonomy(
         ),
         response_model=TaxonomyPlanResult,
         max_tokens=_TAXONOMY_PLAN_MAX_TOKENS,
+        usage_callback=usage_callback,
     )
     return _finalize_taxonomy_plan(
         plan,
         materialized=materialized,
         summary=summary,
         existing_briefs=existing_briefs,
+    )
+
+
+def _build_plan_bucket(
+    actions: PagePlanActions, preview_limit: int = _PLAN_PREVIEW_LIMIT
+) -> CompilePlanBucket:
+    return CompilePlanBucket(
+        create_count=len(actions.create),
+        update_count=len(actions.update),
+        related_count=len(actions.related),
+        create=[
+            CompilePlanPreviewItem(slug=item.slug, title=item.title, brief=item.brief)
+            for item in actions.create[:preview_limit]
+        ],
+        update=[
+            CompilePlanPreviewItem(slug=item.slug, title=item.title, brief=item.brief)
+            for item in actions.update[:preview_limit]
+        ],
+        related=actions.related[:preview_limit],
+    )
+
+
+def _merge_plan_buckets(
+    buckets: list[CompilePlanBucket], preview_limit: int = _PLAN_PREVIEW_LIMIT
+) -> CompilePlanBucket:
+    merged = CompilePlanBucket()
+    for bucket in buckets:
+        merged.create_count += bucket.create_count
+        merged.update_count += bucket.update_count
+        merged.related_count += bucket.related_count
+        remaining_create = preview_limit - len(merged.create)
+        remaining_update = preview_limit - len(merged.update)
+        remaining_related = preview_limit - len(merged.related)
+        if remaining_create > 0:
+            merged.create.extend(bucket.create[:remaining_create])
+        if remaining_update > 0:
+            merged.update.extend(bucket.update[:remaining_update])
+        if remaining_related > 0:
+            merged.related.extend(bucket.related[:remaining_related])
+    return merged
+
+
+def _build_compile_plan_summary(
+    materialized_docs: list[_MaterializedDocument],
+    plans_by_hash: dict[str, TaxonomyPlanResult],
+    preview_limit: int = _PLAN_PREVIEW_LIMIT,
+) -> CompilePlanSummary:
+    documents: list[CompilePlanDocument] = []
+    topic_buckets: list[CompilePlanBucket] = []
+    regulation_buckets: list[CompilePlanBucket] = []
+    procedure_buckets: list[CompilePlanBucket] = []
+    conflict_buckets: list[CompilePlanBucket] = []
+    evidence_count = 0
+
+    for materialized in materialized_docs:
+        plan = plans_by_hash[materialized.document.file_hash]
+        topics = _build_plan_bucket(plan.topics, preview_limit)
+        regulations = _build_plan_bucket(plan.regulations, preview_limit)
+        procedures = _build_plan_bucket(plan.procedures, preview_limit)
+        conflicts = _build_plan_bucket(plan.conflicts, preview_limit)
+        documents.append(
+            CompilePlanDocument(
+                document_name=materialized.document.name,
+                topics=topics,
+                regulations=regulations,
+                procedures=procedures,
+                conflicts=conflicts,
+                evidence_count=len(plan.evidence),
+            )
+        )
+        topic_buckets.append(topics)
+        regulation_buckets.append(regulations)
+        procedure_buckets.append(procedures)
+        conflict_buckets.append(conflicts)
+        evidence_count += len(plan.evidence)
+
+    return CompilePlanSummary(
+        topics=_merge_plan_buckets(topic_buckets, preview_limit),
+        regulations=_merge_plan_buckets(regulation_buckets, preview_limit),
+        procedures=_merge_plan_buckets(procedure_buckets, preview_limit),
+        conflicts=_merge_plan_buckets(conflict_buckets, preview_limit),
+        evidence_count=evidence_count,
+        documents=documents,
     )
 
 
@@ -1327,6 +1497,7 @@ async def _draft_topic_page(
     item: PagePlanItem,
     is_update: bool,
     existing_body: str,
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> TopicPageOutput:
     """Draft or rewrite one topic page with structured LLM output."""
     try:
@@ -1345,6 +1516,7 @@ async def _draft_topic_page(
                 field_guide=_TOPIC_FIELD_GUIDE,
             ),
             response_model=TopicPageOutput,
+            usage_callback=usage_callback,
         )
     except Exception:
         return _draft_topic(summary, item)
@@ -1359,6 +1531,7 @@ async def _draft_regulation_page(
     item: PagePlanItem,
     is_update: bool,
     existing_body: str,
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> RegulationPageOutput:
     """Draft or rewrite one regulation page with structured LLM output."""
     try:
@@ -1377,6 +1550,7 @@ async def _draft_regulation_page(
                 field_guide=_REGULATION_FIELD_GUIDE,
             ),
             response_model=RegulationPageOutput,
+            usage_callback=usage_callback,
         )
     except Exception:
         return _draft_regulation(summary, item)
@@ -1391,6 +1565,7 @@ async def _draft_procedure_page(
     item: PagePlanItem,
     is_update: bool,
     existing_body: str,
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> ProcedurePageOutput:
     """Draft or rewrite one procedure page with structured LLM output."""
     try:
@@ -1409,6 +1584,7 @@ async def _draft_procedure_page(
                 field_guide=_PROCEDURE_FIELD_GUIDE,
             ),
             response_model=ProcedurePageOutput,
+            usage_callback=usage_callback,
         )
     except Exception:
         return _draft_procedure(summary, item)
@@ -1423,6 +1599,7 @@ async def _draft_conflict_page(
     item: PagePlanItem,
     is_update: bool,
     existing_body: str,
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> ConflictPageOutput:
     """Draft or rewrite one planner-generated conflict page with structured LLM output."""
     try:
@@ -1441,6 +1618,7 @@ async def _draft_conflict_page(
                 field_guide=_CONFLICT_FIELD_GUIDE,
             ),
             response_model=ConflictPageOutput,
+            usage_callback=usage_callback,
         )
     except Exception:
         return _draft_conflict(summary, item)
@@ -1518,6 +1696,7 @@ def _confirm_conflict(
     right_title: str,
     left_text: str,
     right_text: str,
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> ConflictCheckResult:
     messages = [
         {
@@ -1541,6 +1720,7 @@ def _confirm_conflict(
             model=model,
             messages=messages,
             response_model=ConflictCheckResult,
+            usage_callback=usage_callback,
         )
     except ValidationError:
         left_lower = left_text.lower()
@@ -1616,6 +1796,7 @@ def _apply_actions(
     summary_to_pages: dict[str, set[Path]],
     draft_create_update: DraftCreateUpdateFn[RenderModelT],
     render_markdown: Callable[[RenderModelT], str],
+    usage_callback: UsageDeltaCallback | None = None,
 ) -> list[Path]:
     """Apply one page-type action batch generated by taxonomy planning.
 
@@ -1659,6 +1840,7 @@ def _apply_actions(
                         item=item,
                         is_update=is_update,
                         existing_body=existing_body,
+                        usage_callback=usage_callback,
                     )
 
             return await asyncio.gather(
@@ -1718,6 +1900,9 @@ def compile_documents(
     api_key: str,
     language: str,
     stage_callback: StageCallback | None = None,
+    counter_callback: CounterCallback | None = None,
+    plan_callback: PlanCallback | None = None,
+    usage_callback: UsageCallback | None = None,
 ) -> CompileArtifacts:
     """Compile documents into taxonomy-native wiki pages for Milestone 2."""
     # ASCII pipeline snapshot (for reviewer at one glance):
@@ -1754,12 +1939,23 @@ def compile_documents(
     related_conflicts_by_page: dict[Path, set[str]] = defaultdict(set)
     related_evidence_by_page: dict[Path, set[str]] = defaultdict(set)
 
+    def _action_total(actions: PagePlanActions) -> int:
+        return len(actions.create) + len(actions.update) + len(actions.related)
+
     with provider_env(provider, api_key):
         # Step 1: materialize source artifacts for both short and long documents.
         _emit_stage(
             stage_callback, "indexing-long-docs", "Materializing source artifacts"
         )
-        for document in documents:
+        _emit_counter(
+            counter_callback,
+            "indexing-long-docs",
+            0,
+            len(documents),
+            "documents",
+            "documents",
+        )
+        for index, document in enumerate(documents, start=1):
             if document.requires_pageindex:
                 materialized = _materialize_long_document(
                     workspace, document, artifacts
@@ -1767,14 +1963,31 @@ def compile_documents(
             else:
                 materialized = _materialize_short_document(workspace, document)
             materialized_docs.append(materialized)
+            _emit_counter(
+                counter_callback,
+                "indexing-long-docs",
+                index,
+                len(documents),
+                "documents",
+                "documents",
+            )
 
         # Step 2: generate typed summaries and persist summary pages.
         _emit_stage(stage_callback, "summarizing", "Generating typed summaries")
-        for materialized in materialized_docs:
+        _emit_counter(
+            counter_callback,
+            "summarizing",
+            0,
+            len(materialized_docs),
+            "documents",
+            "summaries",
+        )
+        for index, materialized in enumerate(materialized_docs, start=1):
             summary = _summarize_document(
                 model=model,
                 language=language,
                 materialized=materialized,
+                usage_callback=_stage_usage_reporter(usage_callback, "summarizing"),
             )
             summaries_by_hash[materialized.document.file_hash] = summary
             summary_slug_by_hash[materialized.document.file_hash] = (
@@ -1786,6 +1999,14 @@ def compile_documents(
                 summary=summary,
             )
             _append_unique(artifacts.summaries, summary_page)
+            _emit_counter(
+                counter_callback,
+                "summarizing",
+                index,
+                len(materialized_docs),
+                "documents",
+                "summaries",
+            )
 
         # Step 3: create taxonomy-native plans from summaries.
         _emit_stage(stage_callback, "planning-taxonomy", "Planning taxonomy actions")
@@ -1797,7 +2018,15 @@ def compile_documents(
             "conflicts": _existing_page_briefs(workspace / "wiki", "conflicts"),
             "evidence": _existing_page_briefs(workspace / "wiki", "evidence"),
         }
-        for materialized in materialized_docs:
+        _emit_counter(
+            counter_callback,
+            "planning-taxonomy",
+            0,
+            len(materialized_docs),
+            "documents",
+            "plans",
+        )
+        for index, materialized in enumerate(materialized_docs, start=1):
             summary = summaries_by_hash[materialized.document.file_hash]
             plan = _plan_taxonomy(
                 model=model,
@@ -1805,22 +2034,50 @@ def compile_documents(
                 materialized=materialized,
                 summary=summary,
                 existing_briefs=existing_briefs,
+                usage_callback=_stage_usage_reporter(
+                    usage_callback, "planning-taxonomy"
+                ),
             )
             plans_by_hash[materialized.document.file_hash] = plan
+            _emit_counter(
+                counter_callback,
+                "planning-taxonomy",
+                index,
+                len(materialized_docs),
+                "documents",
+                "plans",
+            )
+        _emit_plan(
+            plan_callback,
+            _build_compile_plan_summary(materialized_docs, plans_by_hash),
+        )
 
         # Step 4: draft and write topic pages.
         _emit_stage(
             stage_callback, "writing-topics", "Drafting and writing topic pages"
         )
+        topic_total = sum(
+            _action_total(plan.topics) for plan in plans_by_hash.values()
+        )
+        topic_completed = 0
+        _emit_counter(
+            counter_callback,
+            "writing-topics",
+            0,
+            topic_total,
+            "pages",
+            "pages",
+        )
         for materialized in materialized_docs:
             doc_hash = materialized.document.file_hash
+            topic_actions = plans_by_hash[doc_hash].topics
             _apply_actions(
                 workspace=workspace,
                 page_type="topics",
                 model=model,
                 language=language,
                 document_name=materialized.document.name,
-                actions=plans_by_hash[doc_hash].topics,
+                actions=topic_actions,
                 summary_slug=summary_slug_by_hash[doc_hash],
                 summary=summaries_by_hash[doc_hash],
                 artifacts_bucket=artifacts.topics,
@@ -1828,6 +2085,16 @@ def compile_documents(
                 summary_to_pages=summary_to_pages,
                 draft_create_update=_draft_topic_page,
                 render_markdown=_render_topic_page,
+                usage_callback=_stage_usage_reporter(usage_callback, "writing-topics"),
+            )
+            topic_completed += _action_total(topic_actions)
+            _emit_counter(
+                counter_callback,
+                "writing-topics",
+                topic_completed,
+                topic_total,
+                "pages",
+                "pages",
             )
 
         # Step 5: draft and write regulation pages.
@@ -1837,15 +2104,28 @@ def compile_documents(
             "Drafting and writing regulation pages",
         )
         touched_regulations: list[Path] = []
+        regulation_total = sum(
+            _action_total(plan.regulations) for plan in plans_by_hash.values()
+        )
+        regulation_completed = 0
+        _emit_counter(
+            counter_callback,
+            "writing-regulations",
+            0,
+            regulation_total,
+            "pages",
+            "pages",
+        )
         for materialized in materialized_docs:
             doc_hash = materialized.document.file_hash
+            regulation_actions = plans_by_hash[doc_hash].regulations
             touched = _apply_actions(
                 workspace=workspace,
                 page_type="regulations",
                 model=model,
                 language=language,
                 document_name=materialized.document.name,
-                actions=plans_by_hash[doc_hash].regulations,
+                actions=regulation_actions,
                 summary_slug=summary_slug_by_hash[doc_hash],
                 summary=summaries_by_hash[doc_hash],
                 artifacts_bucket=artifacts.regulations,
@@ -1853,8 +2133,20 @@ def compile_documents(
                 summary_to_pages=summary_to_pages,
                 draft_create_update=_draft_regulation_page,
                 render_markdown=_render_regulation_page,
+                usage_callback=_stage_usage_reporter(
+                    usage_callback, "writing-regulations"
+                ),
             )
             touched_regulations.extend(touched)
+            regulation_completed += _action_total(regulation_actions)
+            _emit_counter(
+                counter_callback,
+                "writing-regulations",
+                regulation_completed,
+                regulation_total,
+                "pages",
+                "pages",
+            )
 
         # Step 6: draft and write procedure pages.
         _emit_stage(
@@ -1863,15 +2155,28 @@ def compile_documents(
             "Drafting and writing procedure pages",
         )
         touched_procedures: list[Path] = []
+        procedure_total = sum(
+            _action_total(plan.procedures) for plan in plans_by_hash.values()
+        )
+        procedure_completed = 0
+        _emit_counter(
+            counter_callback,
+            "writing-procedures",
+            0,
+            procedure_total,
+            "pages",
+            "pages",
+        )
         for materialized in materialized_docs:
             doc_hash = materialized.document.file_hash
+            procedure_actions = plans_by_hash[doc_hash].procedures
             touched = _apply_actions(
                 workspace=workspace,
                 page_type="procedures",
                 model=model,
                 language=language,
                 document_name=materialized.document.name,
-                actions=plans_by_hash[doc_hash].procedures,
+                actions=procedure_actions,
                 summary_slug=summary_slug_by_hash[doc_hash],
                 summary=summaries_by_hash[doc_hash],
                 artifacts_bucket=artifacts.procedures,
@@ -1879,46 +2184,29 @@ def compile_documents(
                 summary_to_pages=summary_to_pages,
                 draft_create_update=_draft_procedure_page,
                 render_markdown=_render_procedure_page,
+                usage_callback=_stage_usage_reporter(
+                    usage_callback, "writing-procedures"
+                ),
             )
             touched_procedures.extend(touched)
-
-        # Step 7: draft planner conflicts and run incremental cross-document checks.
-        _emit_stage(
-            stage_callback,
-            "writing-conflicts",
-            "Drafting and writing conflict pages",
-        )
-        for materialized in materialized_docs:
-            doc_hash = materialized.document.file_hash
-            touched_conflicts = _apply_actions(
-                workspace=workspace,
-                page_type="conflicts",
-                model=model,
-                language=language,
-                document_name=materialized.document.name,
-                actions=plans_by_hash[doc_hash].conflicts,
-                summary_slug=summary_slug_by_hash[doc_hash],
-                summary=summaries_by_hash[doc_hash],
-                artifacts_bucket=artifacts.conflicts,
-                summary_to_links=summary_to_links,
-                summary_to_pages=summary_to_pages,
-                draft_create_update=_draft_conflict_page,
-                render_markdown=_render_conflict_page,
+            procedure_completed += _action_total(procedure_actions)
+            _emit_counter(
+                counter_callback,
+                "writing-procedures",
+                procedure_completed,
+                procedure_total,
+                "pages",
+                "pages",
             )
-            for conflict_page in touched_conflicts:
-                conflict_link = f"[[conflicts/{conflict_page.stem}]]"
-                for derived in summary_to_pages[summary_slug_by_hash[doc_hash]]:
-                    related_conflicts_by_page[derived].add(conflict_link)
 
-        # Candidate pool for incremental conflict detection:
-        # - compare only regulations/procedures pages (M2 scope)
-        # - prioritize pages touched in this compile run as the left side
+        # Conflict detection compares only touched regulation/procedure pages against
+        # the current canonical pool, and evaluates each ordered pair once.
         all_reg_proc = sorted(
             set((workspace / "wiki" / "regulations").glob("*.md"))
             | set((workspace / "wiki" / "procedures").glob("*.md"))
         )
         touched_for_detection = sorted(set(touched_regulations + touched_procedures))
-        # Use canonical ordered pairs so (A,B) and (B,A) are evaluated once.
+        candidate_pairs: list[tuple[Path, Path]] = []
         checked_pairs: set[tuple[str, str]] = set()
         for left_path in touched_for_detection:
             left_meta, left_body = _read_page(left_path)
@@ -1931,39 +2219,109 @@ def compile_documents(
                     continue
                 left_key = str(left_path)
                 right_key = str(right_path)
-                pair: tuple[str, str] = (
+                candidate_pair_key: tuple[str, str] = (
                     (left_key, right_key)
                     if left_key <= right_key
                     else (right_key, left_key)
                 )
-                if pair in checked_pairs:
+                if candidate_pair_key in checked_pairs:
                     continue
-                checked_pairs.add(pair)
+                checked_pairs.add(candidate_pair_key)
 
                 right_meta, right_body = _read_page(right_path)
                 right_title = _extract_title(right_meta, right_body, right_path.stem)
-                # Cheap code-side narrowing before calling the LLM:
-                # require at least 2 overlapping subject tokens.
                 overlap = left_tokens & _tokenize_subject(right_title)
                 if len(overlap) < 2:
                     continue
+                candidate_pairs.append((left_path, right_path))
 
-                # LLM confirms whether this shortlisted pair is a real conflict.
-                decision = _confirm_conflict(
-                    model=model,
-                    language=language,
-                    left_title=left_title,
-                    right_title=right_title,
-                    left_text=left_body,
-                    right_text=right_body,
-                )
-                if not decision.is_conflict:
-                    continue
+        # Step 7: draft planner conflicts and run incremental cross-document checks.
+        _emit_stage(
+            stage_callback,
+            "writing-conflicts",
+            "Drafting and writing conflict pages",
+        )
+        planner_conflict_total = sum(
+            _action_total(plan.conflicts) for plan in plans_by_hash.values()
+        )
+        conflict_total = planner_conflict_total + len(candidate_pairs)
+        conflict_completed = 0
+        _emit_counter(
+            counter_callback,
+            "writing-conflicts",
+            0,
+            conflict_total,
+            "items",
+            "conflict work items",
+        )
+        for materialized in materialized_docs:
+            doc_hash = materialized.document.file_hash
+            conflict_actions = plans_by_hash[doc_hash].conflicts
+            touched_conflicts = _apply_actions(
+                workspace=workspace,
+                page_type="conflicts",
+                model=model,
+                language=language,
+                document_name=materialized.document.name,
+                actions=conflict_actions,
+                summary_slug=summary_slug_by_hash[doc_hash],
+                summary=summaries_by_hash[doc_hash],
+                artifacts_bucket=artifacts.conflicts,
+                summary_to_links=summary_to_links,
+                summary_to_pages=summary_to_pages,
+                draft_create_update=_draft_conflict_page,
+                render_markdown=_render_conflict_page,
+                usage_callback=_stage_usage_reporter(
+                    usage_callback, "writing-conflicts"
+                ),
+            )
+            for conflict_page in touched_conflicts:
+                conflict_link = f"[[conflicts/{conflict_page.stem}]]"
+                for derived in summary_to_pages[summary_slug_by_hash[doc_hash]]:
+                    related_conflicts_by_page[derived].add(conflict_link)
+            conflict_completed += _action_total(conflict_actions)
+            _emit_counter(
+                counter_callback,
+                "writing-conflicts",
+                conflict_completed,
+                conflict_total,
+                "items",
+                "conflict work items",
+            )
 
+        if candidate_pairs:
+            _emit_stage(
+                stage_callback,
+                "writing-conflicts",
+                "Checking regulation and procedure pairs for conflicts",
+            )
+
+        for left_path, right_path in candidate_pairs:
+            left_meta, left_body = _read_page(left_path)
+            left_title = _extract_title(left_meta, left_body, left_path.stem)
+            right_meta, right_body = _read_page(right_path)
+            right_title = _extract_title(right_meta, right_body, right_path.stem)
+            left_key = str(left_path)
+            right_key = str(right_path)
+            conflict_pair_key: tuple[str, str] = (
+                (left_key, right_key) if left_key <= right_key else (right_key, left_key)
+            )
+
+            # LLM confirms whether this shortlisted pair is a real conflict.
+            decision = _confirm_conflict(
+                model=model,
+                language=language,
+                left_title=left_title,
+                right_title=right_title,
+                left_text=left_body,
+                right_text=right_body,
+                usage_callback=_stage_usage_reporter(usage_callback, "writing-conflicts"),
+            )
+            if decision.is_conflict:
                 conflict_title = (
                     decision.title.strip() or f"{left_title} vs {right_title}"
                 )
-                suffix = hashlib.sha1((pair[0] + pair[1]).encode("utf-8")).hexdigest()[
+                suffix = hashlib.sha1((conflict_pair_key[0] + conflict_pair_key[1]).encode("utf-8")).hexdigest()[
                     :6
                 ]
                 conflict_slug = f"{_slugify(conflict_title)}-{suffix}"
@@ -2025,11 +2383,21 @@ def compile_documents(
                     if match:
                         summary_to_links[match.group(1)].add(conflict_link)
 
+            conflict_completed += 1
+            _emit_counter(
+                counter_callback,
+                "writing-conflicts",
+                conflict_completed,
+                conflict_total,
+                "items",
+                "conflict work items",
+            )
+
         # Step 8: merge evidence entries by normalized claim key.
         # Planner outputs can emit equivalent evidence claims phrased differently.
         # Hashing by a canonical key collapses those duplicates before writing.
         _emit_stage(
-            stage_callback, "writing-evidence", "Merging claim-centric evidence"
+            stage_callback, "writing-evidence", "Collecting claim-centric evidence"
         )
         evidence_map: dict[str, _EvidenceAggregate] = {}
         for materialized in materialized_docs:
@@ -2058,7 +2426,20 @@ def compile_documents(
                 )
 
         # Sort by claim key so reruns produce deterministic file names/order.
-        for claim_key, aggregate in sorted(evidence_map.items()):
+        _emit_stage(
+            stage_callback, "writing-evidence", "Writing claim-centric evidence pages"
+        )
+        _emit_counter(
+            counter_callback,
+            "writing-evidence",
+            0,
+            len(evidence_map),
+            "pages",
+            "evidence pages",
+        )
+        for index, (claim_key, aggregate) in enumerate(
+            sorted(evidence_map.items()), start=1
+        ):
             claim = aggregate.claim
             source_links = sorted(aggregate.source_summaries)
             quotes = aggregate.quotes
@@ -2112,15 +2493,46 @@ def compile_documents(
                     summary_to_links[summary_slug].add(evidence_link)
                     for derived in summary_to_pages[summary_slug]:
                         related_evidence_by_page[derived].add(evidence_link)
+            _emit_counter(
+                counter_callback,
+                "writing-evidence",
+                index,
+                len(evidence_map),
+                "pages",
+                "evidence pages",
+            )
 
         # Step 9: apply backlink sections on summaries and derived pages.
         _emit_stage(stage_callback, "backlinking", "Applying code-driven backlinks")
+        backlink_total = len(
+            set(artifacts.summaries)
+            | set(related_conflicts_by_page)
+            | set(related_evidence_by_page)
+        )
+        backlinked_pages: set[Path] = set()
+        _emit_counter(
+            counter_callback,
+            "backlinking",
+            0,
+            backlink_total,
+            "pages",
+            "touched pages",
+        )
         for summary_path in artifacts.summaries:
             summary_slug = summary_path.stem
             meta, body = _read_page(summary_path)
             links = sorted(summary_to_links.get(summary_slug, set()))
             body = _ensure_links_in_section(body, "Derived Pages", links)
             _write_page(summary_path, meta, body)
+            backlinked_pages.add(summary_path)
+            _emit_counter(
+                counter_callback,
+                "backlinking",
+                len(backlinked_pages),
+                backlink_total,
+                "pages",
+                "touched pages",
+            )
 
         for page_path, links in related_conflicts_by_page.items():
             if not page_path.exists():
@@ -2128,6 +2540,15 @@ def compile_documents(
             meta, body = _read_page(page_path)
             body = _ensure_links_in_section(body, "Related Conflicts", sorted(links))
             _write_page(page_path, meta, body)
+            backlinked_pages.add(page_path)
+            _emit_counter(
+                counter_callback,
+                "backlinking",
+                len(backlinked_pages),
+                backlink_total,
+                "pages",
+                "touched pages",
+            )
 
         for page_path, links in related_evidence_by_page.items():
             if not page_path.exists():
@@ -2135,6 +2556,15 @@ def compile_documents(
             meta, body = _read_page(page_path)
             body = _ensure_links_in_section(body, "Related Evidence", sorted(links))
             _write_page(page_path, meta, body)
+            backlinked_pages.add(page_path)
+            _emit_counter(
+                counter_callback,
+                "backlinking",
+                len(backlinked_pages),
+                backlink_total,
+                "pages",
+                "touched pages",
+            )
 
     return artifacts
 

@@ -36,6 +36,61 @@ class AddResult(BaseModel):
     job_id: str | None = None
 
 
+class TokenUsageSummary(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    calls: int = 0
+    available: bool = False
+
+
+class StageCounter(BaseModel):
+    completed: int = 0
+    total: int = 0
+    unit: str = "items"
+    item_label: str | None = None
+
+
+class CompilePlanItem(BaseModel):
+    slug: str
+    title: str
+    brief: str = ""
+
+
+class CompilePlanBucket(BaseModel):
+    create_count: int = 0
+    update_count: int = 0
+    related_count: int = 0
+    create: list[CompilePlanItem] = Field(default_factory=list)
+    update: list[CompilePlanItem] = Field(default_factory=list)
+    related: list[str] = Field(default_factory=list)
+
+
+class CompilePlanDocument(BaseModel):
+    document_name: str
+    topics: CompilePlanBucket = Field(default_factory=CompilePlanBucket)
+    regulations: CompilePlanBucket = Field(default_factory=CompilePlanBucket)
+    procedures: CompilePlanBucket = Field(default_factory=CompilePlanBucket)
+    conflicts: CompilePlanBucket = Field(default_factory=CompilePlanBucket)
+    evidence_count: int = 0
+
+
+class CompilePlanSummary(BaseModel):
+    topics: CompilePlanBucket = Field(default_factory=CompilePlanBucket)
+    regulations: CompilePlanBucket = Field(default_factory=CompilePlanBucket)
+    procedures: CompilePlanBucket = Field(default_factory=CompilePlanBucket)
+    conflicts: CompilePlanBucket = Field(default_factory=CompilePlanBucket)
+    evidence_count: int = 0
+    documents: list[CompilePlanDocument] = Field(default_factory=list)
+
+
+class CompileProgressDetails(BaseModel):
+    counters: dict[str, StageCounter] = Field(default_factory=dict)
+    plan: CompilePlanSummary | None = None
+    usage_total: TokenUsageSummary = Field(default_factory=TokenUsageSummary)
+    usage_by_stage: dict[str, TokenUsageSummary] = Field(default_factory=dict)
+
+
 class JobRecord(BaseModel):
     job_id: str
     kind: str
@@ -47,6 +102,7 @@ class JobRecord(BaseModel):
     progress: float | None = None
     message: str | None = None
     error: str | None = None
+    compile: CompileProgressDetails | None = None
 
 
 class WorkspaceStatus(BaseModel):

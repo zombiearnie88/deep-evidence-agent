@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from evidence_compiler.models import DocumentRecord, JobRecord
+from evidence_compiler.models import CompileProgressDetails, DocumentRecord, JobRecord
 
 
 def now_iso() -> str:
@@ -159,6 +159,7 @@ class JobStore:
         message: str | None = None,
         error: str | None = None,
         payload: dict[str, object] | None = None,
+        compile: CompileProgressDetails | None = None,
     ) -> JobRecord:
         """Update selected fields for an existing job."""
         job = self.read(job_id)
@@ -174,6 +175,8 @@ class JobStore:
             job.error = error
         if payload is not None:
             job.payload = payload
+        if compile is not None:
+            job.compile = compile
         job.updated_at = now_iso()
         self._write(job)
         return job

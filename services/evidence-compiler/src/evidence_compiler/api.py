@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -18,10 +19,15 @@ from evidence_compiler.credentials import (
 from evidence_compiler.lint import run_structural_lint
 from evidence_compiler.models import (
     AddResult,
+    CompilePlanSummary,
+    CompileProgressDetails,
     CompileResult,
     CredentialStatus,
     DocumentRecord,
+    JobRecord,
     ProviderOption,
+    StageCounter,
+    TokenUsageSummary,
     WorkspaceInitResult,
     WorkspaceStatus,
 )
@@ -38,6 +44,158 @@ from evidence_compiler.state import HashRegistry, JobStore, now_iso
 
 class MissingCredentialsError(ValueError):
     """Raised when workspace credential bundle is missing or incomplete."""
+
+
+_STAGE_PROGRESS_RANGES: dict[str, tuple[float, float]] = {
+    "preparing": (0.02, 0.05),
+    "indexing-long-docs": (0.05, 0.12),
+    "summarizing": (0.12, 0.24),
+    "planning-taxonomy": (0.24, 0.36),
+    "writing-topics": (0.36, 0.5),
+    "writing-regulations": (0.5, 0.62),
+    "writing-procedures": (0.62, 0.72),
+    "writing-conflicts": (0.72, 0.82),
+    "writing-evidence": (0.82, 0.9),
+    "backlinking": (0.9, 0.94),
+    "updating-index": (0.94, 0.97),
+    "linting": (0.97, 0.99),
+    "completed": (1.0, 1.0),
+    "failed": (1.0, 1.0),
+}
+
+
+def _merge_usage(
+    current: TokenUsageSummary, delta: TokenUsageSummary
+) -> TokenUsageSummary:
+    current_has_data = (
+        current.calls > 0
+        or current.prompt_tokens > 0
+        or current.completion_tokens > 0
+        or current.total_tokens > 0
+    )
+    available = delta.available if not current_has_data else current.available and delta.available
+    return TokenUsageSummary(
+        prompt_tokens=current.prompt_tokens + delta.prompt_tokens,
+        completion_tokens=current.completion_tokens + delta.completion_tokens,
+        total_tokens=current.total_tokens + delta.total_tokens,
+        calls=current.calls + delta.calls,
+        available=available,
+    )
+
+
+class _CompileJobTracker:
+    """Track compile progress in memory and persist only meaningful changes."""
+
+    def __init__(self, jobs: JobStore, job: JobRecord) -> None:
+        self._jobs: JobStore = jobs
+        self.job_id: str = job.job_id
+        self._payload: dict[str, object] = dict(job.payload)
+        self._status: str = job.status
+        self._stage: str | None = job.stage
+        self._progress: float = float(job.progress) if job.progress is not None else 0.0
+        self._message: str | None = job.message
+        self._error: str | None = job.error
+        self._compile: CompileProgressDetails = (
+            job.compile.model_copy(deep=True)
+            if job.compile is not None
+            else CompileProgressDetails()
+        )
+        self._last_snapshot: str = self._snapshot()
+
+    def _snapshot(self) -> str:
+        return json.dumps(
+            {
+                "status": self._status,
+                "stage": self._stage,
+                "progress": round(self._progress, 6),
+                "message": self._message,
+                "error": self._error,
+                "payload": self._payload,
+                "compile": self._compile.model_dump(mode="json"),
+            },
+            sort_keys=True,
+        )
+
+    def _stage_progress(self, stage: str, completed: int | None = None, total: int | None = None) -> float:
+        start, end = _STAGE_PROGRESS_RANGES.get(stage, (0.0, 1.0))
+        if total is None or total <= 0 or completed is None:
+            return start
+        ratio = max(0.0, min(1.0, completed / total))
+        return start + ((end - start) * ratio)
+
+    def flush(self) -> None:
+        snapshot = self._snapshot()
+        if snapshot == self._last_snapshot:
+            return
+        self._jobs.update(
+            self.job_id,
+            status=self._status,
+            stage=self._stage,
+            progress=self._progress,
+            message=self._message,
+            error=self._error,
+            payload=self._payload,
+            compile=self._compile,
+        )
+        self._last_snapshot = snapshot
+
+    def set_stage(self, stage: str, message: str) -> None:
+        self._status = "running"
+        self._stage = stage
+        self._message = message
+        self._error = None
+        counter = self._compile.counters.get(stage)
+        if counter is None:
+            self._progress = self._stage_progress(stage)
+        else:
+            self._progress = self._stage_progress(stage, counter.completed, counter.total)
+        self.flush()
+
+    def set_counter(
+        self,
+        stage: str,
+        completed: int,
+        total: int,
+        unit: str,
+        item_label: str | None = None,
+    ) -> None:
+        self._compile.counters[stage] = StageCounter(
+            completed=completed,
+            total=total,
+            unit=unit,
+            item_label=item_label,
+        )
+        if self._stage == stage:
+            self._progress = self._stage_progress(stage, completed, total)
+        self.flush()
+
+    def set_plan(self, plan_summary: CompilePlanSummary) -> None:
+        self._compile.plan = plan_summary
+        self.flush()
+
+    def add_usage(self, stage: str, usage_delta: TokenUsageSummary) -> None:
+        current_stage_usage = self._compile.usage_by_stage.get(stage, TokenUsageSummary())
+        self._compile.usage_by_stage[stage] = _merge_usage(current_stage_usage, usage_delta)
+        self._compile.usage_total = _merge_usage(self._compile.usage_total, usage_delta)
+        self.flush()
+
+    def complete(self, *, payload_updates: dict[str, object] | None = None) -> None:
+        if payload_updates:
+            self._payload = {**self._payload, **payload_updates}
+        self._status = "completed"
+        self._stage = "completed"
+        self._progress = 1.0
+        self._message = "Compilation completed"
+        self._error = None
+        self.flush()
+
+    def fail(self, error: Exception) -> None:
+        self._status = "failed"
+        self._stage = "failed"
+        self._progress = 1.0
+        self._message = "Compilation failed"
+        self._error = str(error)
+        self.flush()
 
 
 def _resolve_workspace(path: Path) -> Path:
@@ -416,56 +574,24 @@ def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
     config = load_config(workspace / ".brain" / "config.yaml")
     jobs = JobStore(workspace / ".brain" / "jobs")
 
-    stage_progress: dict[str, float] = {
-        "preparing": 0.05,
-        "indexing-long-docs": 0.12,
-        "summarizing": 0.24,
-        "planning-taxonomy": 0.36,
-        "writing-topics": 0.5,
-        "writing-regulations": 0.62,
-        "writing-procedures": 0.72,
-        "writing-conflicts": 0.82,
-        "writing-evidence": 0.9,
-        "backlinking": 0.94,
-        "updating-index": 0.97,
-        "linting": 0.99,
-        "completed": 1.0,
+    payload: dict[str, object] = {
+        "document_hashes": [document.file_hash for document in documents],
+        "document_count": len(documents),
+        "provider": provider,
+        "model": model,
     }
 
-    def _set_stage(stage: str, message: str) -> None:
-        jobs.update(
-            job.job_id,
-            stage=stage,
-            progress=stage_progress.get(stage, 0.5),
-            message=message,
-        )
-
     if job_id is None:
-        job = jobs.create(
-            kind="compile",
-            status="running",
-            payload={
-                "document_hashes": [document.file_hash for document in documents],
-                "document_count": len(documents),
-                "provider": provider,
-                "model": model,
-            },
-        )
-        _set_stage("preparing", "Preparing compile pipeline")
+        job = jobs.create(kind="compile", status="running", payload=payload)
     else:
         job = jobs.update(
             job_id,
             status="running",
-            stage="preparing",
-            progress=stage_progress["preparing"],
-            message="Preparing compile pipeline",
-            payload={
-                "document_hashes": [document.file_hash for document in documents],
-                "document_count": len(documents),
-                "provider": provider,
-                "model": model,
-            },
+            payload=payload,
         )
+
+    tracker = _CompileJobTracker(jobs, job)
+    tracker.set_stage("preparing", "Preparing compile pipeline")
 
     registry = HashRegistry(workspace / ".brain" / "hashes.json")
 
@@ -477,13 +603,16 @@ def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
             model=model,
             api_key=api_key,
             language=str(config.get("language", DEFAULT_CONFIG["language"])),
-            stage_callback=_set_stage,
+            stage_callback=tracker.set_stage,
+            counter_callback=tracker.set_counter,
+            plan_callback=tracker.set_plan,
+            usage_callback=tracker.add_usage,
         )
 
-        _set_stage("updating-index", "Updating wiki index")
+        tracker.set_stage("updating-index", "Updating wiki index")
         rebuild_index(workspace, artifacts)
 
-        _set_stage("linting", "Running structural lint checks")
+        tracker.set_stage("linting", "Running structural lint checks")
         lint_report = run_structural_lint(workspace)
         lint_path = (
             workspace
@@ -504,14 +633,9 @@ def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
                 updates["pageindex_artifact_path"] = artifact_path
             registry.update_document(document.file_hash, **updates)
 
-        jobs.update(
-            job.job_id,
-            status="completed",
-            stage="completed",
-            progress=1.0,
-            message="Compilation completed",
-            payload={
-                **job.payload,
+        tracker.complete(
+            payload_updates={
+                **payload,
                 "created_pages": artifacts.total_pages,
                 "lint_report": str(lint_path),
             },
@@ -529,12 +653,5 @@ def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
             job_id=job.job_id,
         )
     except Exception as error:
-        jobs.update(
-            job.job_id,
-            status="failed",
-            stage="failed",
-            progress=1.0,
-            error=str(error),
-            message="Compilation failed",
-        )
+        tracker.fail(error)
         raise

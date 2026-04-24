@@ -311,6 +311,22 @@ async def enqueue_compile(payload: CompileRequest) -> CompileResult:
         )
 
     jobs = JobStore(workspace_path / ".brain" / "jobs")
+    active_compile_jobs = [
+        job
+        for job in jobs.list_jobs()
+        if job.kind == "compile" and job.status in {"queued", "running"}
+    ]
+    if active_compile_jobs:
+        active_job = active_compile_jobs[-1]
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "compile_already_running",
+                "message": "A compile job is already queued or running for this workspace",
+                "job_id": active_job.job_id,
+            },
+        )
+
     job = jobs.create(
         kind="compile",
         status="queued",
@@ -426,7 +442,7 @@ async def get_job(
         workspace: Workspace id or path passed as query parameter.
 
     Returns:
-        One persisted job record with status and progress metadata.
+        One persisted job record with status, progress, and typed compile telemetry.
 
     Raises:
         HTTPException: If workspace is invalid or job id does not exist.

@@ -49,6 +49,75 @@ type CompileResponse = {
   created_pages: number;
 };
 
+type TokenUsageSummary = {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  calls: number;
+  available: boolean;
+};
+
+type StageCounter = {
+  completed: number;
+  total: number;
+  unit: string;
+  item_label: string | null;
+};
+
+type CompilePlanItem = {
+  slug: string;
+  title: string;
+  brief: string;
+};
+
+type CompilePlanBucket = {
+  create_count: number;
+  update_count: number;
+  related_count: number;
+  create: CompilePlanItem[];
+  update: CompilePlanItem[];
+  related: string[];
+};
+
+type CompilePlanDocument = {
+  document_name: string;
+  topics: CompilePlanBucket;
+  regulations: CompilePlanBucket;
+  procedures: CompilePlanBucket;
+  conflicts: CompilePlanBucket;
+  evidence_count: number;
+};
+
+type CompilePlanSummary = {
+  topics: CompilePlanBucket;
+  regulations: CompilePlanBucket;
+  procedures: CompilePlanBucket;
+  conflicts: CompilePlanBucket;
+  evidence_count: number;
+  documents: CompilePlanDocument[];
+};
+
+type CompileProgressDetails = {
+  counters: Record<string, StageCounter>;
+  plan: CompilePlanSummary | null;
+  usage_total: TokenUsageSummary;
+  usage_by_stage: Record<string, TokenUsageSummary>;
+};
+
+type JobRecord = {
+  job_id: string;
+  kind: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  payload: Record<string, unknown>;
+  stage: string | null;
+  progress: number | null;
+  message: string | null;
+  error: string | null;
+  compile: CompileProgressDetails | null;
+};
+
 type ProviderItem = {
   provider_id: string;
   label: string;
@@ -89,6 +158,72 @@ const surfaceStyle: CSSProperties = {
   boxShadow: "0 8px 24px rgba(8, 30, 52, 0.08)",
 };
 
+const compilePollIntervalMs = 900;
+
+function formatUsage(usage: TokenUsageSummary | null | undefined): string {
+  if (!usage || !usage.available) {
+    return "N/A";
+  }
+  return `${usage.total_tokens.toLocaleString()} tokens (${usage.calls} calls)`;
+}
+
+function formatProgress(progress: number | null | undefined): string {
+  const safe = Math.max(0, Math.min(1, progress ?? 0));
+  return `${Math.round(safe * 100)}%`;
+}
+
+function statusBadgeStyle(status: string | null | undefined): CSSProperties {
+  if (status === "completed") {
+    return { background: "#d8f3df", color: "#0f6b2e" };
+  }
+  if (status === "failed") {
+    return { background: "#fee6e5", color: "#a6332b" };
+  }
+  if (status === "running") {
+    return { background: "#e6f0ff", color: "#1f57c3" };
+  }
+  return { background: "#eef2f6", color: "#4f6478" };
+}
+
+function bucketTotal(bucket: CompilePlanBucket): number {
+  return bucket.create_count + bucket.update_count + bucket.related_count;
+}
+
+function formatPlanSummary(plan: CompilePlanSummary): string {
+  return [
+    `${bucketTotal(plan.topics)} topics`,
+    `${bucketTotal(plan.regulations)} regulations`,
+    `${bucketTotal(plan.procedures)} procedures`,
+    `${bucketTotal(plan.conflicts)} conflicts`,
+    `${plan.evidence_count} evidence`,
+  ].join(", ");
+}
+
+function formatCounter(counter: StageCounter | null | undefined): string {
+  if (!counter) {
+    return "-";
+  }
+  return `${counter.completed}/${counter.total} ${counter.item_label ?? counter.unit}`;
+}
+
+function planBucketPreview(bucket: CompilePlanBucket): string {
+  const parts: string[] = [];
+  if (bucket.create_count > 0) {
+    parts.push(`create=${bucket.create_count}`);
+  }
+  if (bucket.update_count > 0) {
+    parts.push(`update=${bucket.update_count}`);
+  }
+  if (bucket.related_count > 0) {
+    parts.push(`related=${bucket.related_count}`);
+  }
+  return parts.join(", ") || "none";
+}
+
+function previewItems(items: CompilePlanItem[]): string {
+  return items.map((item) => item.title || item.slug).join(", ") || "-";
+}
+
 export function AppShell({ pickImportPaths }: AppShellProps = {}) {
   const apiBase = useMemo(() => {
     const runtimeConfig = globalThis as { __EVIDENCE_BRAIN_SERVICE_URL__?: string };
@@ -109,6 +244,10 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
   const [actionInfo, setActionInfo] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
+  const [activeCompileJobId, setActiveCompileJobId] = useState<string>("");
+  const [activeCompileWorkspaceRef, setActiveCompileWorkspaceRef] = useState<string>("");
+  const [activeCompileJob, setActiveCompileJob] = useState<JobRecord | null>(null);
+  const [compilePollError, setCompilePollError] = useState<string>("");
 
   const loadOverview = async () => {
     setBusy(true);
@@ -213,6 +352,21 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
     }
   };
 
+  const loadJob = async (jobId: string, workspaceRef: string): Promise<JobRecord> => {
+    const response = await fetch(
+      `${apiBase}/jobs/${encodeURIComponent(jobId)}?workspace=${encodeURIComponent(workspaceRef)}`,
+    );
+    if (!response.ok) {
+      throw new Error(`job request failed: ${response.status}`);
+    }
+    const payload = (await response.json()) as JobRecord;
+    setActiveCompileWorkspaceRef(workspaceRef);
+    setActiveCompileJobId(jobId);
+    setActiveCompileJob(payload);
+    setCompilePollError("");
+    return payload;
+  };
+
   useEffect(() => {
     if (!selectedWorkspace) {
       return;
@@ -220,6 +374,60 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
     void loadDocuments(selectedWorkspace);
     void loadCredentialStatus(selectedWorkspace);
   }, [apiBase, selectedWorkspace]);
+
+  useEffect(() => {
+    if (!activeCompileJobId || !activeCompileWorkspaceRef) {
+      return;
+    }
+    if (activeCompileJob?.status === "completed" || activeCompileJob?.status === "failed") {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId = 0;
+
+    const poll = async () => {
+      try {
+        const job = await loadJob(activeCompileJobId, activeCompileWorkspaceRef);
+        if (cancelled) {
+          return;
+        }
+        if (job.status === "completed" || job.status === "failed") {
+          await loadOverview();
+          if (selectedWorkspace === activeCompileWorkspaceRef) {
+            await loadDocuments(activeCompileWorkspaceRef);
+          }
+          return;
+        }
+      } catch (cause) {
+        if (cancelled) {
+          return;
+        }
+        const message = cause instanceof Error ? cause.message : String(cause);
+        setCompilePollError(message);
+      }
+      if (!cancelled) {
+        timeoutId = window.setTimeout(() => {
+          void poll();
+        }, compilePollIntervalMs);
+      }
+    };
+
+    timeoutId = window.setTimeout(() => {
+      void poll();
+    }, compilePollIntervalMs);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [
+    activeCompileJob?.status,
+    activeCompileJobId,
+    activeCompileWorkspaceRef,
+    apiBase,
+    selectedWorkspace,
+  ]);
 
   const onSaveCredentials = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -422,16 +630,29 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
       });
       if (!response.ok) {
         if (response.status === 409) {
-          throw new Error("missing workspace credentials; save and validate key first");
+          const payload = (await response.json()) as {
+            detail?: { code?: string; message?: string; job_id?: string };
+          };
+          if (payload.detail?.code === "compile_already_running" && payload.detail.job_id) {
+            setActionInfo(`compile already running: job=${payload.detail.job_id}`);
+            await loadJob(payload.detail.job_id, selectedWorkspace);
+            return;
+          }
+          if (payload.detail?.code === "missing_llm_credentials") {
+            throw new Error("missing workspace credentials; save and validate key first");
+          }
+          throw new Error(payload.detail?.message ?? `queue compile failed: ${response.status}`);
         }
         throw new Error(`queue compile failed: ${response.status}`);
       }
       const payload = (await response.json()) as CompileResponse;
+      if (payload.job_id) {
+        await loadJob(payload.job_id, selectedWorkspace);
+      }
       setActionInfo(
-        `compile done: job=${payload.job_id ?? "n/a"}, docs=${payload.processed_files}, pages=${payload.created_pages}`,
+        `compile queued: job=${payload.job_id ?? "n/a"}, docs=${payload.processed_files}`,
       );
       await loadOverview();
-      await loadDocuments(selectedWorkspace);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
@@ -439,6 +660,18 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
       setBusy(false);
     }
   };
+
+  const visibleCompileJob =
+    activeCompileWorkspaceRef === selectedWorkspace ? activeCompileJob : null;
+  const currentStageCounter =
+    visibleCompileJob?.stage && visibleCompileJob.compile?.counters
+      ? visibleCompileJob.compile.counters[visibleCompileJob.stage] ?? null
+      : null;
+  const compileIsActiveForSelectedWorkspace =
+    activeCompileWorkspaceRef === selectedWorkspace &&
+    Boolean(activeCompileJobId) &&
+    visibleCompileJob?.status !== "completed" &&
+    visibleCompileJob?.status !== "failed";
 
   return (
     <UIProvider>
@@ -560,12 +793,12 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
               <Button
                 type="button"
                 variant="secondary"
-                disabled={busy || !selectedWorkspace}
+                disabled={busy || !selectedWorkspace || compileIsActiveForSelectedWorkspace}
                 onClick={() => {
                   void onQueueCompile();
                 }}
               >
-                Queue Compile
+                {compileIsActiveForSelectedWorkspace ? "Compile Running" : "Queue Compile"}
               </Button>
             </form>
 
@@ -663,6 +896,189 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
               </p>
             ) : null}
           </section>
+
+          {activeCompileWorkspaceRef === selectedWorkspace && (visibleCompileJob || compilePollError) ? (
+            <section style={{ ...surfaceStyle, display: "grid", gap: 12 }}>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <h2 style={{ margin: 0 }}>Compile Progress</h2>
+                {visibleCompileJob ? (
+                  <span
+                    style={{
+                      ...statusBadgeStyle(visibleCompileJob.status),
+                      padding: "4px 8px",
+                      borderRadius: 99,
+                      fontWeight: 700,
+                    }}
+                  >
+                    {visibleCompileJob.status}
+                  </span>
+                ) : null}
+                {visibleCompileJob ? <code>{visibleCompileJob.job_id}</code> : null}
+              </div>
+
+              {visibleCompileJob ? (
+                <>
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: 12,
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <strong>{formatProgress(visibleCompileJob.progress)}</strong>
+                      <span>
+                        stage: <code>{visibleCompileJob.stage ?? "-"}</code>
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        height: 10,
+                        borderRadius: 999,
+                        overflow: "hidden",
+                        background: "#e8eef5",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: formatProgress(visibleCompileJob.progress),
+                          height: "100%",
+                          background: "linear-gradient(90deg, #4d93ff 0%, #1f57c3 100%)",
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  <div style={{ display: "grid", gap: 4 }}>
+                    <span>
+                      message: <code>{visibleCompileJob.message ?? "-"}</code>
+                    </span>
+                    <span>
+                      current counter: <code>{formatCounter(currentStageCounter)}</code>
+                    </span>
+                  </div>
+
+                  {visibleCompileJob.compile?.plan ? (
+                    <div style={{ display: "grid", gap: 8 }}>
+                      <strong>Planned Outputs</strong>
+                      <span>{formatPlanSummary(visibleCompileJob.compile.plan)}</span>
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {visibleCompileJob.compile.plan.documents.map((document) => (
+                          <details
+                            key={document.document_name}
+                            style={{ border: "1px solid #d7dce3", borderRadius: 10, padding: 10 }}
+                          >
+                            <summary style={{ cursor: "pointer", fontWeight: 600 }}>
+                              {document.document_name}
+                            </summary>
+                            <div style={{ display: "grid", gap: 6, marginTop: 10 }}>
+                              <small>topics: {planBucketPreview(document.topics)}</small>
+                              {document.topics.create.length > 0 ? (
+                                <small>topic create preview: {previewItems(document.topics.create)}</small>
+                              ) : null}
+                              {document.topics.update.length > 0 ? (
+                                <small>topic update preview: {previewItems(document.topics.update)}</small>
+                              ) : null}
+                              {document.topics.related.length > 0 ? (
+                                <small>topic related preview: {document.topics.related.join(", ")}</small>
+                              ) : null}
+
+                              <small>regulations: {planBucketPreview(document.regulations)}</small>
+                              {document.regulations.create.length > 0 ? (
+                                <small>
+                                  regulation create preview: {previewItems(document.regulations.create)}
+                                </small>
+                              ) : null}
+                              {document.regulations.update.length > 0 ? (
+                                <small>
+                                  regulation update preview: {previewItems(document.regulations.update)}
+                                </small>
+                              ) : null}
+                              {document.regulations.related.length > 0 ? (
+                                <small>
+                                  regulation related preview: {document.regulations.related.join(", ")}
+                                </small>
+                              ) : null}
+
+                              <small>procedures: {planBucketPreview(document.procedures)}</small>
+                              {document.procedures.create.length > 0 ? (
+                                <small>
+                                  procedure create preview: {previewItems(document.procedures.create)}
+                                </small>
+                              ) : null}
+                              {document.procedures.update.length > 0 ? (
+                                <small>
+                                  procedure update preview: {previewItems(document.procedures.update)}
+                                </small>
+                              ) : null}
+                              {document.procedures.related.length > 0 ? (
+                                <small>
+                                  procedure related preview: {document.procedures.related.join(", ")}
+                                </small>
+                              ) : null}
+
+                              <small>conflicts: {planBucketPreview(document.conflicts)}</small>
+                              {document.conflicts.create.length > 0 ? (
+                                <small>
+                                  conflict create preview: {previewItems(document.conflicts.create)}
+                                </small>
+                              ) : null}
+                              {document.conflicts.update.length > 0 ? (
+                                <small>
+                                  conflict update preview: {previewItems(document.conflicts.update)}
+                                </small>
+                              ) : null}
+                              {document.conflicts.related.length > 0 ? (
+                                <small>
+                                  conflict related preview: {document.conflicts.related.join(", ")}
+                                </small>
+                              ) : null}
+
+                              <small>evidence: {document.evidence_count}</small>
+                            </div>
+                          </details>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <strong>Token Usage</strong>
+                    <span>
+                      total: <code>{formatUsage(visibleCompileJob.compile?.usage_total)}</code>
+                    </span>
+                    {Object.entries(visibleCompileJob.compile?.usage_by_stage ?? {}).length > 0 ? (
+                      <div style={{ display: "grid", gap: 4 }}>
+                        {Object.entries(visibleCompileJob.compile?.usage_by_stage ?? {}).map(
+                          ([stage, usage]) => (
+                            <small key={stage}>
+                              {stage}: {formatUsage(usage)}
+                            </small>
+                          ),
+                        )}
+                      </div>
+                    ) : (
+                      <small>No stage usage reported yet.</small>
+                    )}
+                  </div>
+
+                  {visibleCompileJob.status === "failed" && visibleCompileJob.error ? (
+                    <p style={{ margin: 0, color: "#a6332b" }}>
+                      Failure: <code>{visibleCompileJob.error}</code>
+                    </p>
+                  ) : null}
+                </>
+              ) : null}
+
+              {compilePollError ? (
+                <p style={{ margin: 0, color: "#a66d1f" }}>
+                  Polling retrying after error: <code>{compilePollError}</code>
+                </p>
+              ) : null}
+            </section>
+          ) : null}
 
           <section style={surfaceStyle}>
             <h2 style={{ marginTop: 0 }}>Documents ({documents.length})</h2>

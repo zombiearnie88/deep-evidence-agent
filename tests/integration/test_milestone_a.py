@@ -25,9 +25,10 @@ from evidence_compiler.api import (
     get_status,
     init_workspace,
 )
+from evidence_compiler.state import JobStore
 
 
-def _fake_llm_completion(*args, **kwargs):
+def _fake_llm_payload(*args, **kwargs) -> dict[str, object]:
     response_format = kwargs.get("response_format")
     schema_name = ""
     if isinstance(response_format, type):
@@ -154,7 +155,7 @@ def _fake_llm_completion(*args, **kwargs):
     elif schema_name == "_CredentialValidationResult":
         payload = {"status": "OK"}
     else:
-        payload = {
+        return {
             "summary": "Test summary",
             "topics": [
                 {"title": "Medication Safety", "summary": "Safe dispensing checks"}
@@ -181,6 +182,10 @@ def _fake_llm_completion(*args, **kwargs):
             ],
         }
 
+    return payload
+
+
+def _build_fake_response(payload: dict[str, object], usage: dict[str, int] | None):
     class _Message:
         content = json.dumps(payload)
 
@@ -190,11 +195,29 @@ def _fake_llm_completion(*args, **kwargs):
     class _Response:
         choices = [_Choice()]
 
-    return _Response()
+    response = _Response()
+    if usage is not None:
+        response.usage = usage
+    return response
+
+
+def _fake_llm_completion(*args, **kwargs):
+    return _build_fake_response(
+        _fake_llm_payload(*args, **kwargs),
+        {"prompt_tokens": 120, "completion_tokens": 60, "total_tokens": 180},
+    )
+
+
+def _fake_llm_completion_no_usage(*args, **kwargs):
+    return _build_fake_response(_fake_llm_payload(*args, **kwargs), None)
 
 
 async def _fake_llm_acompletion(*args, **kwargs):
     return _fake_llm_completion(*args, **kwargs)
+
+
+async def _fake_llm_acompletion_no_usage(*args, **kwargs):
+    return _fake_llm_completion_no_usage(*args, **kwargs)
 
 
 class _MemoryKeyring:
@@ -875,6 +898,24 @@ class CompilerMilestoneATest(unittest.TestCase):
                     compile_result = compile_workspace(workspace)
             self.assertEqual(compile_result.processed_files, 1)
             self.assertIsNotNone(compile_result.job_id)
+            assert compile_result.job_id is not None
+
+            jobs = JobStore(workspace / ".brain" / "jobs")
+            compile_job = jobs.read(compile_result.job_id)
+            self.assertEqual(compile_job.status, "completed")
+            self.assertIsNotNone(compile_job.compile)
+            assert compile_job.compile is not None
+            self.assertIsNotNone(compile_job.compile.plan)
+            self.assertGreater(compile_job.compile.usage_total.total_tokens, 0)
+            self.assertTrue(compile_job.compile.usage_total.available)
+            self.assertTrue(compile_job.compile.usage_by_stage)
+            self.assertEqual(
+                compile_job.compile.usage_total.total_tokens,
+                sum(
+                    usage.total_tokens
+                    for usage in compile_job.compile.usage_by_stage.values()
+                ),
+            )
 
             summary_pages = list((workspace / "wiki" / "summaries").glob("*.md"))
             self.assertEqual(len(summary_pages), 1)
@@ -905,6 +946,60 @@ class CompilerMilestoneATest(unittest.TestCase):
             self.assertIn("## Overview", summary_page)
             self.assertIn("## Key points", summary_page)
             self.assertIn("- Verify dosage before dispensing.", summary_page)
+
+    def test_compile_job_marks_usage_unavailable_when_provider_omits_it(self) -> None:
+        """Compile telemetry should keep usage safe when the provider reports none."""
+        memory_keyring = _MemoryKeyring()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            source = root / "policy.md"
+            source.write_text("# Policy\n\nVerify each dose before release.", encoding="utf-8")
+
+            _ = init_workspace(workspace)
+            _ = add_path(workspace, source)
+
+            with (
+                patch(
+                    "evidence_compiler.credentials.keyring.get_password",
+                    side_effect=memory_keyring.get_password,
+                ),
+                patch(
+                    "evidence_compiler.credentials.keyring.set_password",
+                    side_effect=memory_keyring.set_password,
+                ),
+                patch(
+                    "evidence_compiler.credentials.keyring.delete_password",
+                    side_effect=memory_keyring.delete_password,
+                ),
+            ):
+                set_workspace_credentials(
+                    workspace,
+                    provider="openai",
+                    model="gpt-5.4-mini",
+                    api_key="test-key",
+                )
+
+                with (
+                    patch(
+                        "evidence_compiler.compiler.pipeline.litellm.completion",
+                        side_effect=_fake_llm_completion_no_usage,
+                    ),
+                    patch(
+                        "evidence_compiler.compiler.pipeline.litellm.acompletion",
+                        side_effect=_fake_llm_acompletion_no_usage,
+                    ),
+                ):
+                    compile_result = compile_workspace(workspace)
+
+            self.assertIsNotNone(compile_result.job_id)
+            assert compile_result.job_id is not None
+            jobs = JobStore(workspace / ".brain" / "jobs")
+            compile_job = jobs.read(compile_result.job_id)
+            self.assertIsNotNone(compile_job.compile)
+            assert compile_job.compile is not None
+            self.assertFalse(compile_job.compile.usage_total.available)
+            self.assertGreater(compile_job.compile.usage_total.calls, 0)
 
 
 class BrainServiceMilestoneATest(unittest.TestCase):
@@ -986,17 +1081,100 @@ class BrainServiceMilestoneATest(unittest.TestCase):
                         job_id = queue_payload["job_id"]
 
                         final_status = "queued"
+                        final_job: dict[str, object] = {}
                         for _ in range(40):
                             job = client.get(
                                 f"/jobs/{job_id}", params={"workspace": workspace_id}
                             )
                             self.assertEqual(job.status_code, 200)
-                            final_status = job.json()["status"]
+                            final_job = job.json()
+                            final_status = str(final_job["status"])
                             if final_status in {"completed", "failed"}:
                                 break
                             time.sleep(0.05)
 
                         self.assertEqual(final_status, "completed")
+                        self.assertIn("compile", final_job)
+                        compile_payload = final_job["compile"]
+                        assert isinstance(compile_payload, dict)
+                        self.assertIn("plan", compile_payload)
+                        self.assertGreater(
+                            int(compile_payload["usage_total"]["total_tokens"]), 0
+                        )
+                        self.assertTrue(compile_payload["usage_by_stage"])
+            finally:
+                if previous is None:
+                    os.environ.pop("EVIDENCE_BRAIN_WORKSPACES_DIR", None)
+                else:
+                    os.environ["EVIDENCE_BRAIN_WORKSPACES_DIR"] = previous
+
+    def test_duplicate_compile_request_returns_active_job(self) -> None:
+        """Queueing compile twice should surface the existing active job id."""
+        memory_keyring = _MemoryKeyring()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "workspaces"
+            workspace_root.mkdir(parents=True, exist_ok=True)
+
+            source = Path(temp_dir) / "policy.txt"
+            source.write_text("Hospital policy A", encoding="utf-8")
+
+            previous = os.environ.get("EVIDENCE_BRAIN_WORKSPACES_DIR")
+            os.environ["EVIDENCE_BRAIN_WORKSPACES_DIR"] = str(workspace_root)
+            try:
+                module = importlib.import_module("brain_service.main")
+                module = importlib.reload(module)
+                client = TestClient(module.app)
+
+                created = client.post("/workspaces", json={"name": "pilot-site"})
+                self.assertEqual(created.status_code, 200)
+                workspace_id = created.json()["workspace_id"]
+
+                ingested = client.post(
+                    "/documents/ingest",
+                    json={"workspace": workspace_id, "path": str(source)},
+                )
+                self.assertEqual(ingested.status_code, 200)
+
+                with (
+                    patch(
+                        "evidence_compiler.credentials.keyring.get_password",
+                        side_effect=memory_keyring.get_password,
+                    ),
+                    patch(
+                        "evidence_compiler.credentials.keyring.set_password",
+                        side_effect=memory_keyring.set_password,
+                    ),
+                    patch(
+                        "evidence_compiler.credentials.keyring.delete_password",
+                        side_effect=memory_keyring.delete_password,
+                    ),
+                ):
+                    configured = client.put(
+                        f"/workspaces/{workspace_id}/credentials",
+                        json={
+                            "provider": "openai",
+                            "model": "gpt-5.4-mini",
+                            "api_key": "test-key",
+                        },
+                    )
+                    self.assertEqual(configured.status_code, 200)
+
+                    with patch("brain_service.main._compile_in_background"):
+                        first = client.post(
+                            "/jobs/compile", json={"workspace": workspace_id}
+                        )
+                        self.assertEqual(first.status_code, 200)
+                        first_job_id = first.json()["job_id"]
+
+                        second = client.post(
+                            "/jobs/compile", json={"workspace": workspace_id}
+                        )
+                        self.assertEqual(second.status_code, 409)
+                        second_detail = second.json()["detail"]
+                        self.assertEqual(
+                            second_detail["code"], "compile_already_running"
+                        )
+                        self.assertEqual(second_detail["job_id"], first_job_id)
             finally:
                 if previous is None:
                     os.environ.pop("EVIDENCE_BRAIN_WORKSPACES_DIR", None)
