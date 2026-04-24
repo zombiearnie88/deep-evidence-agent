@@ -224,6 +224,14 @@ function previewItems(items: CompilePlanItem[]): string {
   return items.map((item) => item.title || item.slug).join(", ") || "-";
 }
 
+function payloadString(
+  payload: Record<string, unknown> | null | undefined,
+  key: string,
+): string | null {
+  const value = payload?.[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
 export function AppShell({ pickImportPaths }: AppShellProps = {}) {
   const apiBase = useMemo(() => {
     const runtimeConfig = globalThis as { __EVIDENCE_BRAIN_SERVICE_URL__?: string };
@@ -672,6 +680,8 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
     Boolean(activeCompileJobId) &&
     visibleCompileJob?.status !== "completed" &&
     visibleCompileJob?.status !== "failed";
+  const compileProvider = payloadString(visibleCompileJob?.payload, "provider");
+  const compileModel = payloadString(visibleCompileJob?.payload, "model");
 
   return (
     <UIProvider>
@@ -878,9 +888,14 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
                 >
                   Validate
                 </Button>
-                <span style={{ alignSelf: "center" }}>
-                  credentials: {credentialStatus?.has_api_key ? "saved" : "missing"}, validated: {credentialStatus?.validated ? "yes" : "no"}
-                </span>
+                <div style={{ alignSelf: "center", display: "grid", gap: 2 }}>
+                  <span>
+                    credentials: {credentialStatus?.has_api_key ? "saved" : "missing"}, validated: {credentialStatus?.validated ? "yes" : "no"}
+                  </span>
+                  <span>
+                    configured provider: <code>{credentialStatus?.provider ?? "-"}</code>, model: <code>{credentialStatus?.model ?? "-"}</code>
+                  </span>
+                </div>
               </div>
             </form>
 
@@ -954,6 +969,9 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
                   <div style={{ display: "grid", gap: 4 }}>
                     <span>
                       message: <code>{visibleCompileJob.message ?? "-"}</code>
+                    </span>
+                    <span>
+                      runtime: <code>{compileProvider ?? "-"}</code> / <code>{compileModel ?? "-"}</code>
                     </span>
                     <span>
                       current counter: <code>{formatCounter(currentStageCounter)}</code>
