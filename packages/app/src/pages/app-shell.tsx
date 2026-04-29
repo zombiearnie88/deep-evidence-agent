@@ -545,18 +545,37 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
     lastWatchCompileJobIdRef.current = "";
     void loadDocuments(selectedWorkspace);
     void loadCredentialStatus(selectedWorkspace);
-    void loadWatchStatus(selectedWorkspace, true).catch((cause) => {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      setWatchPollError(message);
-    });
-    void loadWatchBacklog(selectedWorkspace).catch((cause) => {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      setWatchBacklogError(message);
-    });
+    void loadWatchStatus(selectedWorkspace, true)
+      .then((status) => {
+        if (!status?.enabled) {
+          setWatchBacklogItems([]);
+          setSelectedBacklogPaths([]);
+          setWatchBacklogError("");
+          return;
+        }
+        return loadWatchBacklog(selectedWorkspace).catch((cause) => {
+          const message = cause instanceof Error ? cause.message : String(cause);
+          setWatchBacklogError(message);
+        });
+      })
+      .catch((cause) => {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        setWatchPollError(message);
+      });
   }, [apiBase, selectedWorkspace]);
 
   useEffect(() => {
-    if (!selectedWorkspace) {
+    if (watchStatus?.enabled !== false) {
+      return;
+    }
+    setWatchBacklogItems([]);
+    setSelectedBacklogPaths([]);
+    setWatchBacklogError("");
+  }, [watchStatus?.enabled]);
+
+  useEffect(() => {
+    const shouldPollWatch = watchStatus === null || watchStatus.enabled;
+    if (!selectedWorkspace || !shouldPollWatch) {
       return;
     }
 
@@ -564,8 +583,9 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
     let timeoutId = 0;
 
     const poll = async () => {
+      let nextStatus: WatchStatus | null = null;
       try {
-        await loadWatchStatus(selectedWorkspace);
+        nextStatus = await loadWatchStatus(selectedWorkspace);
       } catch (cause) {
         if (cancelled) {
           return;
@@ -574,7 +594,7 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
         setWatchPollError(message);
       }
 
-      if (!cancelled) {
+      if (!cancelled && (nextStatus === null || nextStatus.enabled)) {
         timeoutId = window.setTimeout(() => {
           void poll();
         }, watchPollIntervalMs);
@@ -589,7 +609,7 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [apiBase, selectedWorkspace]);
+  }, [apiBase, selectedWorkspace, watchStatus?.enabled]);
 
   useEffect(() => {
     if (!activeCompileJobId || !activeCompileWorkspaceRef) {
@@ -905,7 +925,9 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
       setWatchStatus(payload);
       setWatchPollError("");
       setActionInfo("watch stopped");
-      await loadWatchBacklog(selectedWorkspace, true);
+      setWatchBacklogItems([]);
+      setSelectedBacklogPaths([]);
+      setWatchBacklogError("");
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
