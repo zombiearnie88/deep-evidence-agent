@@ -225,9 +225,14 @@ def _fake_llm_payload(*args, **kwargs) -> dict[str, object]:
     return payload
 
 
-def _build_fake_response(payload: dict[str, object], usage: dict[str, int] | None):
+def _build_fake_response(
+    payload: object,
+    usage: dict[str, int] | None,
+    *,
+    finish_reason: str | None = None,
+):
     class _Message:
-        content = json.dumps(payload)
+        content = payload if isinstance(payload, str) else json.dumps(payload)
 
     class _Choice:
         message = _Message()
@@ -236,6 +241,7 @@ def _build_fake_response(payload: dict[str, object], usage: dict[str, int] | Non
         choices = [_Choice()]
 
     response = _Response()
+    response.choices[0].finish_reason = finish_reason
     if usage is not None:
         response.usage = usage
     return response
@@ -347,6 +353,61 @@ class MarkdownRenderFormattingTest(unittest.TestCase):
         self.assertIn("\n- Avoid when the pathogen is not susceptible.", formatted)
         self.assertNotIn("### Otitis Media  Treatment", formatted)
         self.assertNotIn("producers.  - Use", formatted)
+
+    def test_normalize_summary_markdown_repairs_cefixime_run_on_sections(self) -> None:
+        """Cefixime sample headings and inline bullets should no longer render on one line."""
+        markdown = (
+            "## Uses for Cefixime in Adults and Pediatric Patients >=6 Months of Age "
+            "(Unless Specified Otherwise) ### Urinary Tract Infections (UTIs) Treatment "
+            "of uncomplicated UTIs caused by susceptible E. coli or Proteus mirabilis. "
+            "### Other Off-Label Uses - Pneumonia (mild-moderate, community-acquired). "
+            "- Lyme disease (disseminated). - Shigellosis."
+        )
+
+        formatted = compiler_pipeline._normalize_summary_markdown(markdown)
+
+        self.assertGreater(len(formatted.splitlines()), 4)
+        self.assertIn("\n\n### Urinary Tract Infections", formatted)
+        self.assertIn("\n### Other Off-Label Uses\n", formatted)
+        self.assertIn("\n- Pneumonia (mild-moderate, community-acquired).\n", formatted)
+        self.assertIn("\n- Lyme disease (disseminated).\n", formatted)
+        self.assertIn("\n- Shigellosis.", formatted)
+        self.assertNotIn("Otherwise) ### Urinary", formatted)
+        self.assertNotIn("Uses - Pneumonia", formatted)
+
+    def test_normalize_summary_markdown_repairs_cefuroxime_run_on_sections(self) -> None:
+        """Cefuroxime sample should demote stray H1 and split inline bullets."""
+        markdown = (
+            "# Overview of Cefuroxime Uses and Dosing (Medically Reviewed Nov 10, 2025).  "
+            "# Key Indications  "
+            "- **Acute Otitis Media (AOM)**: Susceptible bacteria in >=13 years.  "
+            "- **Bone/Joint Infections**: Parenteral for S. aureus."
+        )
+
+        formatted = compiler_pipeline._normalize_summary_markdown(markdown)
+
+        self.assertTrue(formatted.startswith("## Overview of Cefuroxime Uses and Dosing"))
+        self.assertIn("\n\n## Key Indications\n", formatted)
+        self.assertIn(
+            "\n- **Acute Otitis Media (AOM)**: Susceptible bacteria in >=13 years.\n",
+            formatted,
+        )
+        self.assertIn("\n- **Bone/Joint Infections**: Parenteral for S. aureus.", formatted)
+        self.assertNotIn("# Key Indications  -", formatted)
+
+    def test_summary_prompt_requires_multiline_markdown_body(self) -> None:
+        """Summary prompt should explicitly require multiline markdown in JSON output."""
+        messages = compiler_pipeline._summary_messages(
+            doc_name="cefixime_2025-08-10.md",
+            text="Source text",
+            language="English",
+        )
+
+        prompt = messages[-1]["content"]
+        self.assertIn("encode line breaks as \\n inside the JSON string", prompt)
+        self.assertIn("Keep summary_markdown concise", prompt)
+        self.assertIn("Do not include any # top-level heading", prompt)
+        self.assertIn("Do not place heading plus prose", prompt)
 
 
 class TaxonomyPlannerPostprocessTest(unittest.TestCase):
@@ -482,6 +543,55 @@ class TaxonomyPlannerPostprocessTest(unittest.TestCase):
         self.assertEqual(
             structured_completion.call_args.kwargs["max_tokens"],
             compiler_pipeline._TAXONOMY_PLAN_MAX_TOKENS,
+        )
+
+    def test_summarize_document_uses_dedicated_max_tokens(self) -> None:
+        """Summary generation should use a bounded completion budget."""
+        with patch(
+            "evidence_compiler.compiler.pipeline._structured_completion"
+        ) as structured_completion:
+            structured_completion.return_value = compiler_pipeline.SummaryStageResult(
+                document_brief="Short planning brief.",
+                summary_markdown="## Overview\nPlanner summary body.",
+            )
+
+            compiler_pipeline._summarize_document(
+                model="gpt-5.4-mini",
+                language="English",
+                materialized=self._materialized("planner-source.md"),
+            )
+
+        self.assertEqual(structured_completion.call_count, 1)
+        self.assertEqual(
+            structured_completion.call_args.kwargs["max_tokens"],
+            compiler_pipeline._SUMMARY_MAX_TOKENS,
+        )
+
+    def test_plan_evidence_uses_dedicated_max_tokens(self) -> None:
+        """Evidence planning should use a larger bounded completion budget."""
+        summary = compiler_pipeline.SummaryStageResult(
+            document_brief="Short planning brief.",
+            summary_markdown="## Overview\nPlanner summary body.",
+        )
+
+        with patch(
+            "evidence_compiler.compiler.pipeline._structured_completion"
+        ) as structured_completion:
+            structured_completion.return_value = compiler_pipeline.EvidencePlanActions()
+
+            compiler_pipeline._plan_evidence(
+                model="gpt-5.4-mini",
+                language="English",
+                materialized=self._materialized("planner-source.md"),
+                summary=summary,
+                existing_evidence_briefs={},
+                existing_evidence_pages={},
+            )
+
+        self.assertEqual(structured_completion.call_count, 1)
+        self.assertEqual(
+            structured_completion.call_args.kwargs["max_tokens"],
+            compiler_pipeline._EVIDENCE_PLAN_MAX_TOKENS,
         )
 
     def test_reference_documents_keep_related_regulations_but_prune_overreach(
@@ -690,6 +800,143 @@ class TaxonomyPlannerPostprocessTest(unittest.TestCase):
         )
         self.assertEqual(finalized.update[0].claim, "Dose must be checked")
         self.assertEqual(finalized.create[0].brief, "Verify before dispensing.")
+
+
+class StructuredCompletionWrapperTest(unittest.TestCase):
+    """Keep structured-output fallback behavior narrow and diagnosable."""
+
+    def test_structured_completion_retries_only_when_response_format_is_rejected(
+        self,
+    ) -> None:
+        """Provider capability errors may retry without `response_format`."""
+
+        def fake_completion(*args, **kwargs):
+            if "response_format" in kwargs:
+                raise RuntimeError("response_format is not supported by this provider")
+            return _build_fake_response(
+                {
+                    "create": [
+                        {
+                            "page_slug": "dose-must-be-checked",
+                            "claim": "Dose must be checked",
+                            "title": "Dose Verification",
+                            "brief": "Verify before dispensing.",
+                        }
+                    ],
+                    "update": [],
+                },
+                None,
+            )
+
+        with patch(
+            "evidence_compiler.compiler.pipeline.litellm.completion",
+            side_effect=fake_completion,
+        ) as completion:
+            result = compiler_pipeline._structured_completion(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": "Plan evidence pages."}],
+                response_model=compiler_pipeline.EvidencePlanActions,
+            )
+
+        self.assertEqual(completion.call_count, 2)
+        self.assertIn("response_format", completion.call_args_list[0].kwargs)
+        self.assertNotIn("response_format", completion.call_args_list[1].kwargs)
+        self.assertEqual([item.page_slug for item in result.create], ["dose-must-be-checked"])
+
+    def test_structured_completion_does_not_retry_on_validation_error(self) -> None:
+        """Schema mismatches should fail fast instead of falling back to repaired JSON."""
+        with patch(
+            "evidence_compiler.compiler.pipeline.litellm.completion",
+            return_value=_build_fake_response({"create": [["page"]], "update": []}, None),
+        ) as completion:
+            with self.assertRaises(compiler_pipeline.ValidationError):
+                compiler_pipeline._structured_completion(
+                    model="gpt-5.4-mini",
+                    messages=[{"role": "user", "content": "Plan evidence pages."}],
+                    response_model=compiler_pipeline.EvidencePlanActions,
+                )
+
+        self.assertEqual(completion.call_count, 1)
+
+    def test_structured_completion_retries_once_on_truncated_structured_json(
+        self,
+    ) -> None:
+        """Incomplete structured JSON should be retried once before failing."""
+        truncated = _build_fake_response(
+            '{"document_brief":"Cefixime brief","summary_markdown":"## Overview',
+            None,
+            finish_reason="length",
+        )
+        recovered = _build_fake_response(
+            {
+                "document_brief": "Cefixime brief",
+                "summary_markdown": "## Overview\nConcise summary body.",
+            },
+            None,
+            finish_reason="stop",
+        )
+
+        with patch(
+            "evidence_compiler.compiler.pipeline.litellm.completion",
+            side_effect=[truncated, recovered],
+        ) as completion:
+            result = compiler_pipeline._structured_completion(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": "Summarize the document."}],
+                response_model=compiler_pipeline.SummaryStageResult,
+                max_tokens=compiler_pipeline._SUMMARY_MAX_TOKENS,
+            )
+
+        self.assertEqual(completion.call_count, 2)
+        self.assertEqual(result.document_brief, "Cefixime brief")
+        self.assertIn("Concise summary body", result.summary_markdown)
+
+    def test_structured_completion_surfaces_second_truncated_structured_json(
+        self,
+    ) -> None:
+        """A second truncated structured response should raise a clear truncation error."""
+        truncated = _build_fake_response(
+            '{"document_brief":"Cefixime brief","summary_markdown":"## Overview',
+            None,
+            finish_reason="length",
+        )
+
+        with patch(
+            "evidence_compiler.compiler.pipeline.litellm.completion",
+            side_effect=[truncated, truncated],
+        ) as completion:
+            with self.assertRaisesRegex(
+                ValueError, "SummaryStageResult structured response truncated"
+            ):
+                compiler_pipeline._structured_completion(
+                    model="gpt-5.4-mini",
+                    messages=[{"role": "user", "content": "Summarize the document."}],
+                    response_model=compiler_pipeline.SummaryStageResult,
+                    max_tokens=compiler_pipeline._SUMMARY_MAX_TOKENS,
+                )
+
+        self.assertEqual(completion.call_count, 2)
+
+    def test_structured_completion_surfaces_truncated_fallback_output(self) -> None:
+        """Fallback parsing should stop on obviously truncated JSON instead of repairing garbage."""
+
+        def fake_completion(*args, **kwargs):
+            if "response_format" in kwargs:
+                raise RuntimeError("response_format is not supported by this provider")
+            return _build_fake_response('{"create":[{"page', None)
+
+        with patch(
+            "evidence_compiler.compiler.pipeline.litellm.completion",
+            side_effect=fake_completion,
+        ) as completion:
+            with self.assertRaisesRegex(ValueError, "truncated"):
+                compiler_pipeline._structured_completion(
+                    model="gpt-5.4-mini",
+                    messages=[{"role": "user", "content": "Plan evidence pages."}],
+                    response_model=compiler_pipeline.EvidencePlanActions,
+                )
+
+        self.assertEqual(completion.call_count, 2)
 
 
 class EvidenceVerificationTest(unittest.TestCase):
