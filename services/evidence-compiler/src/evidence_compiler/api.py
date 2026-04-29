@@ -49,15 +49,18 @@ class MissingCredentialsError(ValueError):
 _STAGE_PROGRESS_RANGES: dict[str, tuple[float, float]] = {
     "preparing": (0.02, 0.05),
     "indexing-long-docs": (0.05, 0.12),
-    "summarizing": (0.12, 0.24),
-    "planning-taxonomy": (0.24, 0.36),
-    "writing-topics": (0.36, 0.5),
-    "writing-regulations": (0.5, 0.62),
-    "writing-procedures": (0.62, 0.72),
-    "writing-conflicts": (0.72, 0.82),
-    "writing-evidence": (0.82, 0.9),
-    "backlinking": (0.9, 0.94),
-    "updating-index": (0.94, 0.97),
+    "summarizing": (0.12, 0.22),
+    "planning-evidence": (0.22, 0.3),
+    "drafting-evidence": (0.3, 0.38),
+    "verifying-evidence": (0.38, 0.46),
+    "planning-taxonomy": (0.46, 0.56),
+    "writing-topics": (0.56, 0.66),
+    "writing-regulations": (0.66, 0.74),
+    "writing-procedures": (0.74, 0.8),
+    "writing-evidence": (0.8, 0.86),
+    "writing-conflicts": (0.86, 0.92),
+    "backlinking": (0.92, 0.95),
+    "updating-index": (0.95, 0.97),
     "linting": (0.97, 0.99),
     "completed": (1.0, 1.0),
     "failed": (1.0, 1.0),
@@ -525,22 +528,31 @@ def get_status(workspace: Path) -> WorkspaceStatus:
     )
 
 
+def _select_compile_targets(documents: list[DocumentRecord]) -> list[DocumentRecord]:
+    """Return the document records that still need compile work."""
+    return [document for document in documents if document.status != "compiled"]
+
+
 def compile_workspace(workspace: Path) -> CompileResult:
     """Compile indexed documents into wiki taxonomy pages and lint report.
 
-    This is the Milestone 2 compile pipeline. It requires workspace credentials,
-    runs extraction/synthesis, rebuilds `wiki/index.md`, emits structural lint,
-    and updates per-document compile status plus compile job progress metadata.
+    This is the Milestone 2 compile pipeline. When uncompiled targets exist, it
+    requires workspace credentials, runs extraction/synthesis, rebuilds
+    `wiki/index.md`, emits structural lint, and updates per-document compile
+    status plus compile job progress metadata.
 
     Args:
         workspace: Initialized workspace root.
 
     Returns:
-        CompileResult with processed-document count, created page count, and job id.
+        CompileResult with processed-target count, created page count, and job id.
+        If no documents need compile work, returns a successful no-op with
+        `processed_files = 0`.
 
     Raises:
-        ValueError: If workspace is not initialized or has no indexed documents.
-        MissingCredentialsError: If provider/model/api-key bundle is missing.
+        ValueError: If workspace is not initialized.
+        MissingCredentialsError: If provider/model/api-key bundle is missing for a
+            non-empty compile target set.
     """
     return run_compile_job(workspace, job_id=None)
 
@@ -553,33 +565,37 @@ def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
         job_id: Existing compile job id to reuse, or `None` to create a new job.
 
     Returns:
-        CompileResult with processed-document count, created page count, and job id.
+        CompileResult with processed-target count, created page count, and job id.
+        If no documents need compile work, returns a successful no-op with
+        `processed_files = 0`.
 
     Raises:
-        ValueError: If workspace is not initialized or has no indexed documents.
-        MissingCredentialsError: If provider/model/api-key bundle is missing.
+        ValueError: If workspace is not initialized.
+        MissingCredentialsError: If provider/model/api-key bundle is missing for a
+            non-empty compile target set.
     """
     workspace = _resolve_workspace(workspace)
     _assert_workspace_initialized(workspace)
 
-    documents = list_documents(workspace)
-    if not documents:
-        raise ValueError("No indexed documents found")
+    all_documents = list_documents(workspace)
+    target_documents = _select_compile_targets(all_documents)
 
-    try:
-        provider, model, api_key = resolve_workspace_credentials(workspace)
-    except ValueError as error:
-        raise MissingCredentialsError(str(error)) from error
+    provider: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    payload: dict[str, object] = {
+        "document_hashes": [document.file_hash for document in target_documents],
+        "document_count": len(target_documents),
+    }
+    if target_documents:
+        try:
+            provider, model, api_key = resolve_workspace_credentials(workspace)
+        except ValueError as error:
+            raise MissingCredentialsError(str(error)) from error
+        payload.update({"provider": provider, "model": model})
 
     config = load_config(workspace / ".brain" / "config.yaml")
     jobs = JobStore(workspace / ".brain" / "jobs")
-
-    payload: dict[str, object] = {
-        "document_hashes": [document.file_hash for document in documents],
-        "document_count": len(documents),
-        "provider": provider,
-        "model": model,
-    }
 
     if job_id is None:
         job = jobs.create(kind="compile", status="running", payload=payload)
@@ -593,12 +609,26 @@ def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
     tracker = _CompileJobTracker(jobs, job)
     tracker.set_stage("preparing", "Preparing compile pipeline")
 
+    if not target_documents:
+        tracker.complete(payload_updates={**payload, "created_pages": 0})
+        _append_log(workspace, "compile", f"job={job.job_id} docs=0 pages=0")
+        return CompileResult(
+            workspace=workspace,
+            processed_files=0,
+            created_pages=0,
+            job_id=job.job_id,
+        )
+
+    assert provider is not None
+    assert model is not None
+    assert api_key is not None
+
     registry = HashRegistry(workspace / ".brain" / "hashes.json")
 
     try:
         artifacts = compile_documents(
             workspace,
-            documents,
+            target_documents,
             provider=provider,
             model=model,
             api_key=api_key,
@@ -623,7 +653,7 @@ def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
         lint_path.parent.mkdir(parents=True, exist_ok=True)
         lint_path.write_text(lint_report, encoding="utf-8")
 
-        for document in documents:
+        for document in target_documents:
             updates: dict[str, object] = {
                 "status": "compiled",
                 "requires_pageindex": False,
@@ -644,11 +674,11 @@ def run_compile_job(workspace: Path, job_id: str | None) -> CompileResult:
         _append_log(
             workspace,
             "compile",
-            f"job={job.job_id} docs={len(documents)} pages={artifacts.total_pages}",
+            f"job={job.job_id} docs={len(target_documents)} pages={artifacts.total_pages}",
         )
         return CompileResult(
             workspace=workspace,
-            processed_files=len(documents),
+            processed_files=len(target_documents),
             created_pages=artifacts.total_pages,
             job_id=job.job_id,
         )

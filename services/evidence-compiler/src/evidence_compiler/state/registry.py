@@ -40,12 +40,21 @@ class HashRegistry:
         """Return a shallow copy of all registry entries."""
         return dict(self._data)
 
+    def _reload(self) -> None:
+        """Refresh in-memory state from disk before merging writes."""
+        if self._path.exists():
+            with self._path.open("r", encoding="utf-8") as fh:
+                self._data = json.load(fh)
+            return
+        self._data = {}
+
     def add_document(self, document: DocumentRecord) -> None:
         """Store one document record under its file hash key.
 
         Args:
             document: Document metadata to persist.
         """
+        self._reload()
         payload = document.model_dump(mode="json")
         self._data[document.file_hash] = payload
         self._persist()
@@ -59,6 +68,7 @@ class HashRegistry:
 
     def update_document(self, file_hash: str, **fields: object) -> None:
         """Update one existing document entry and persist changes."""
+        self._reload()
         current = self._data.get(file_hash)
         if not current:
             return

@@ -14,6 +14,11 @@ from knowledge_models.compiler_api import (
     ProviderOption,
     StageCounter,
     TokenUsageSummary,
+    WatchBacklogIngestRequest,
+    WatchBacklogItem,
+    WatchBacklogResponse,
+    WatchRequest,
+    WatchStatus,
     WorkspaceInitResult,
     WorkspaceStatus,
 )
@@ -34,4 +39,9 @@ __all__ = [
     "CompileResult",
     "CredentialStatus",
     "ProviderOption",
+    "WatchBacklogItem",
+    "WatchBacklogResponse",
+    "WatchBacklogIngestRequest",
+    "WatchRequest",
+    "WatchStatus",
 ]

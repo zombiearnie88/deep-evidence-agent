@@ -15,6 +15,11 @@ This file stores persistent implementation conventions for future coding session
   - `Raises`
 - Keep behavior text current; do not leave stale milestone references.
 - For helpers, at minimum keep a one-line docstring.
+- For non-obvious helper functions anywhere in the repo, add a short comment or
+  docstring that explains purpose, important assumptions, or why the helper
+  exists when that materially improves reviewability.
+- Keep helper comments concise; do not add line-by-line commentary for obvious
+  code.
 
 ## 2) Shared Schema Contract
 
@@ -102,3 +107,6 @@ This file stores persistent implementation conventions for future coding session
   many tiny single-use helpers.
 - `2026-04-24`: Quality gate now includes `npx basedpyright` for Python-side
   changes so compile/service refactors get a static typecheck before finishing.
+- `2026-04-29`: Non-obvious helper functions across the repo should carry short,
+  review-oriented comments or docstrings when that materially improves
+  readability, while still avoiding commentary on obvious code.

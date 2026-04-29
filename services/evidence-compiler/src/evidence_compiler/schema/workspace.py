@@ -14,6 +14,7 @@ WORKSPACE_DIRS = [
     "wiki/conflicts",
     "wiki/evidence",
     "wiki/reports",
+    ".brain/evidence/by-document",
     ".brain/jobs",
 ]
 
@@ -26,8 +27,11 @@ AGENTS_MD = """# Evidence Brain Wiki Schema
 - regulations/ - requirement and applicability pages
 - procedures/ - execution workflow pages by role/department
 - conflicts/ - explicit conflict records between sources and policies
-- evidence/ - quote-level evidence blocks with anchors and provenance
+- evidence/ - claim-centric evidence pages rendered from verified manifests
 - reports/ - generated quality and lint reports
+
+## Internal Compiler State
+- .brain/evidence/by-document/ - authoritative per-document verified evidence manifests
 
 ## Special Files
 - index.md - catalog of curated wiki pages

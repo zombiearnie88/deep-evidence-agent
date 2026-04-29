@@ -36,6 +36,43 @@ class AddResult(BaseModel):
     job_id: str | None = None
 
 
+class WatchRequest(BaseModel):
+    auto_compile: bool = True
+    debounce_seconds: float = Field(default=2.0, gt=0.0)
+
+
+class WatchStatus(BaseModel):
+    workspace: Path
+    enabled: bool = False
+    paths: list[Path] = Field(default_factory=list)
+    auto_compile: bool = True
+    debounce_seconds: float = 2.0
+    pending_paths: int = 0
+    active_compile_job_id: str | None = None
+    last_ingest_job_id: str | None = None
+    last_compile_job_id: str | None = None
+    last_error: str | None = None
+    updated_at: str | None = None
+
+
+class WatchBacklogItem(BaseModel):
+    path: Path
+    name: str
+    size_bytes: int
+    modified_at: str
+
+
+class WatchBacklogResponse(BaseModel):
+    workspace: Path
+    root: Path
+    items: list[WatchBacklogItem] = Field(default_factory=list)
+    total: int = 0
+
+
+class WatchBacklogIngestRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list)
+
+
 class TokenUsageSummary(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0

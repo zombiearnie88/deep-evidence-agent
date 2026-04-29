@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import re
-import threading
 from typing import Annotated
 
+from brain_service.watch_manager import (
+    CompileAlreadyRunningError,
+    MissingCredentialsError,
+    WatchManager,
+    WatchManagerError,
+)
 from evidence_compiler.api import (
-    add_path,
     find_workspace_root,
     get_credentials_status,
     get_provider_catalog,
     get_status,
     init_workspace,
     list_documents,
-    run_compile_job,
     set_workspace_credentials,
     validate_workspace_credentials,
 )
@@ -26,6 +30,10 @@ from knowledge_models.compiler_api import (
     CredentialStatus,
     DocumentsResponse,
     JobRecord,
+    WatchBacklogIngestRequest,
+    WatchBacklogResponse,
+    WatchRequest,
+    WatchStatus,
     ProvidersResponse,
     WorkspaceCreatedResponse,
     WorkspaceInitResult,
@@ -46,8 +54,18 @@ WORKSPACES_DIR = Path(
     )
 ).resolve()
 WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
+WATCH_MANAGER = WatchManager()
 
-app = FastAPI(title="Evidence Brain Service", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Stop active watch sessions when the FastAPI process exits."""
+    try:
+        yield
+    finally:
+        WATCH_MANAGER.stop_all()
+
+app = FastAPI(title="Evidence Brain Service", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,30 +143,6 @@ def _workspace_name(value: str | None) -> str:
         return "workspace"
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value).strip("-").lower()
     return slug or "workspace"
-
-
-def _compile_in_background(workspace: Path, job_id: str) -> None:
-    """Execute compile pipeline in a background thread.
-
-    Args:
-        workspace: Absolute workspace path.
-        job_id: Existing compile job id to update during execution.
-
-    Returns:
-        None.
-    """
-    try:
-        run_compile_job(workspace, job_id=job_id)
-    except Exception as error:
-        jobs = JobStore(workspace / ".brain" / "jobs")
-        jobs.update(
-            job_id,
-            status="failed",
-            stage="failed",
-            progress=1.0,
-            error=str(error),
-            message="Compilation failed",
-        )
 
 
 @app.get("/health")
@@ -271,7 +265,7 @@ async def ingest_documents(payload: AddDocumentRequest) -> AddResult:
     workspace_path = _workspace_from_ref(payload.workspace)
     source_path = Path(payload.path).expanduser().resolve()
     try:
-        result = add_path(workspace_path, source_path)
+        result = WATCH_MANAGER.ingest_path(workspace_path, source_path)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except FileNotFoundError as error:
@@ -287,69 +281,154 @@ async def enqueue_compile(payload: CompileRequest) -> CompileResult:
         payload: Workspace compile request.
 
     Returns:
-        Compile result containing queued job id and initial document count.
+        Compile result containing queued job id and initial target count.
 
     Raises:
-        HTTPException: If credentials are missing or workspace is invalid.
+        HTTPException: If credentials are missing for pending targets or the
+            workspace is invalid.
     """
     workspace_path = _workspace_from_ref(payload.workspace)
     try:
-        documents = list_documents(workspace_path)
+        return WATCH_MANAGER.enqueue_compile(workspace_path)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
-    if not documents:
-        raise HTTPException(status_code=400, detail="No indexed documents found")
-
-    credential_status = get_credentials_status(workspace_path)
-    if not credential_status.has_api_key:
+    except CompileAlreadyRunningError as error:
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "missing_llm_credentials",
-                "message": "Missing workspace credentials",
+                "code": error.code,
+                "message": str(error),
+                "job_id": error.job_id,
             },
-        )
-
-    jobs = JobStore(workspace_path / ".brain" / "jobs")
-    active_compile_jobs = [
-        job
-        for job in jobs.list_jobs()
-        if job.kind == "compile" and job.status in {"queued", "running"}
-    ]
-    if active_compile_jobs:
-        active_job = active_compile_jobs[-1]
+        ) from error
+    except MissingCredentialsError as error:
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "compile_already_running",
-                "message": "A compile job is already queued or running for this workspace",
-                "job_id": active_job.job_id,
+                "code": error.code,
+                "message": str(error),
             },
-        )
+        ) from error
+    except WatchManagerError as error:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
 
-    job = jobs.create(
-        kind="compile",
-        status="queued",
-        payload={
-            "document_hashes": [document.file_hash for document in documents],
-            "document_count": len(documents),
-        },
-    )
 
-    thread = threading.Thread(
-        target=_compile_in_background,
-        args=(workspace_path, job.job_id),
-        daemon=True,
-        name=f"compile-{job.job_id}",
-    )
-    thread.start()
+@app.put("/workspaces/{workspace_id}/watch", response_model=WatchStatus)
+async def put_workspace_watch(
+    workspace_id: str, payload: WatchRequest
+) -> WatchStatus:
+    """Start or update raw-folder watch session for one workspace.
 
-    return CompileResult(
-        workspace=workspace_path,
-        processed_files=len(documents),
-        created_pages=0,
-        job_id=job.job_id,
-    )
+    Args:
+        workspace_id: Workspace id from route path.
+        payload: Watch runtime configuration for `workspace/raw`.
+
+    Returns:
+        Current watch status after `workspace/raw` watch is started or replaced.
+
+    Raises:
+        HTTPException: If workspace is invalid.
+    """
+    workspace_path = _workspace_from_ref(workspace_id)
+    try:
+        return WATCH_MANAGER.put_session(workspace_path, payload)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.get("/workspaces/{workspace_id}/watch", response_model=WatchStatus)
+async def get_workspace_watch(workspace_id: str) -> WatchStatus:
+    """Return current raw-folder watch status for one workspace.
+
+    Args:
+        workspace_id: Workspace id from route path.
+
+    Returns:
+        Current in-memory watch status snapshot for `workspace/raw`.
+
+    Raises:
+        HTTPException: If workspace is invalid or not initialized.
+    """
+    workspace_path = _workspace_from_ref(workspace_id)
+    try:
+        return WATCH_MANAGER.get_status(workspace_path)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.get(
+    "/workspaces/{workspace_id}/watch/backlog", response_model=WatchBacklogResponse
+)
+async def get_workspace_watch_backlog(workspace_id: str) -> WatchBacklogResponse:
+    """Return existing raw files that still need explicit ingest confirmation.
+
+    Args:
+        workspace_id: Workspace id from route path.
+
+    Returns:
+        Backlog scan for `workspace/raw` including candidate file metadata.
+
+    Raises:
+        HTTPException: If workspace is invalid or not initialized.
+    """
+    workspace_path = _workspace_from_ref(workspace_id)
+    try:
+        return WATCH_MANAGER.list_backlog(workspace_path)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.post(
+    "/workspaces/{workspace_id}/watch/backlog/ingest", response_model=AddResult
+)
+async def ingest_workspace_watch_backlog(
+    workspace_id: str, payload: WatchBacklogIngestRequest
+) -> AddResult:
+    """Ingest selected raw backlog files after explicit user confirmation.
+
+    Args:
+        workspace_id: Workspace id from route path.
+        payload: Absolute `workspace/raw` file paths selected by the user.
+
+    Returns:
+        Ingest result summary for the selected backlog files.
+
+    Raises:
+        HTTPException: If workspace is invalid or request paths are malformed.
+    """
+    workspace_path = _workspace_from_ref(workspace_id)
+    try:
+        return WATCH_MANAGER.ingest_backlog_paths(workspace_path, payload.paths)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except WatchManagerError as error:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+
+
+@app.delete("/workspaces/{workspace_id}/watch", response_model=WatchStatus)
+async def delete_workspace_watch(workspace_id: str) -> WatchStatus:
+    """Stop the active raw-folder watch session for one workspace.
+
+    Args:
+        workspace_id: Workspace id from route path.
+
+    Returns:
+        Disabled watch status snapshot after cleanup.
+
+    Raises:
+        HTTPException: If workspace is invalid or not initialized.
+    """
+    workspace_path = _workspace_from_ref(workspace_id)
+    try:
+        return WATCH_MANAGER.stop_session(workspace_path)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @app.get(

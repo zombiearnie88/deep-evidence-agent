@@ -1,5 +1,5 @@
 import { Button, UIProvider } from "@evidence-brain/ui";
-import { type CSSProperties, type FormEvent, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type WorkspaceItem = {
   workspace_id: string;
@@ -47,6 +47,39 @@ type CompileResponse = {
   job_id: string | null;
   processed_files: number;
   created_pages: number;
+};
+
+type WatchRequest = {
+  auto_compile: boolean;
+  debounce_seconds: number;
+};
+
+type WatchStatus = {
+  workspace: string;
+  enabled: boolean;
+  paths: string[];
+  auto_compile: boolean;
+  debounce_seconds: number;
+  pending_paths: number;
+  active_compile_job_id: string | null;
+  last_ingest_job_id: string | null;
+  last_compile_job_id: string | null;
+  last_error: string | null;
+  updated_at: string | null;
+};
+
+type WatchBacklogItem = {
+  path: string;
+  name: string;
+  size_bytes: number;
+  modified_at: string;
+};
+
+type WatchBacklogResponse = {
+  workspace: string;
+  root: string;
+  items: WatchBacklogItem[];
+  total: number;
 };
 
 type TokenUsageSummary = {
@@ -159,6 +192,7 @@ const surfaceStyle: CSSProperties = {
 };
 
 const compilePollIntervalMs = 900;
+const watchPollIntervalMs = 1200;
 
 function formatUsage(usage: TokenUsageSummary | null | undefined): string {
   if (!usage || !usage.available) {
@@ -204,6 +238,35 @@ function formatCounter(counter: StageCounter | null | undefined): string {
     return "-";
   }
   return `${counter.completed}/${counter.total} ${counter.item_label ?? counter.unit}`;
+}
+
+function formatTimestamp(value: string | null | undefined): string {
+  if (!value) {
+    return "-";
+  }
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    return value;
+  }
+  return new Date(timestamp).toLocaleString();
+}
+
+function hasMeaningfulWatchChange(previous: WatchStatus | null, next: WatchStatus): boolean {
+  if (!previous) {
+    return (
+      next.enabled ||
+      Boolean(next.last_ingest_job_id) ||
+      Boolean(next.last_compile_job_id) ||
+      Boolean(next.last_error)
+    );
+  }
+  return (
+    previous.enabled !== next.enabled ||
+    previous.last_ingest_job_id !== next.last_ingest_job_id ||
+    previous.last_compile_job_id !== next.last_compile_job_id ||
+    previous.active_compile_job_id !== next.active_compile_job_id ||
+    previous.last_error !== next.last_error
+  );
 }
 
 function planBucketPreview(bucket: CompilePlanBucket): string {
@@ -256,6 +319,15 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
   const [activeCompileWorkspaceRef, setActiveCompileWorkspaceRef] = useState<string>("");
   const [activeCompileJob, setActiveCompileJob] = useState<JobRecord | null>(null);
   const [compilePollError, setCompilePollError] = useState<string>("");
+  const [watchStatus, setWatchStatus] = useState<WatchStatus | null>(null);
+  const [watchPollError, setWatchPollError] = useState<string>("");
+  const [watchBacklogItems, setWatchBacklogItems] = useState<WatchBacklogItem[]>([]);
+  const [watchBacklogError, setWatchBacklogError] = useState<string>("");
+  const [selectedBacklogPaths, setSelectedBacklogPaths] = useState<string[]>([]);
+  const [watchAutoCompile, setWatchAutoCompile] = useState<boolean>(true);
+  const [watchDebounceSeconds, setWatchDebounceSeconds] = useState<string>("2.0");
+  const watchStatusRef = useRef<WatchStatus | null>(null);
+  const lastWatchCompileJobIdRef = useRef<string>("");
 
   const loadOverview = async () => {
     setBusy(true);
@@ -375,12 +447,148 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
     return payload;
   };
 
+  const loadWatchStatus = async (
+    workspaceRef: string,
+    syncFormState: boolean = false,
+  ): Promise<WatchStatus | null> => {
+    if (!workspaceRef) {
+      watchStatusRef.current = null;
+      setWatchStatus(null);
+      setWatchPollError("");
+      if (syncFormState) {
+        setWatchAutoCompile(true);
+        setWatchDebounceSeconds("2.0");
+      }
+      return null;
+    }
+
+    const response = await fetch(
+      `${apiBase}/workspaces/${encodeURIComponent(workspaceRef)}/watch`,
+    );
+    if (!response.ok) {
+      throw new Error(`watch status failed: ${response.status}`);
+    }
+
+    const payload = (await response.json()) as WatchStatus;
+    const previous = watchStatusRef.current;
+    watchStatusRef.current = payload;
+    setWatchStatus(payload);
+    setWatchPollError("");
+
+    if (syncFormState) {
+      setWatchAutoCompile(payload.auto_compile);
+      setWatchDebounceSeconds(String(payload.debounce_seconds));
+    }
+
+    if (payload.last_compile_job_id !== lastWatchCompileJobIdRef.current) {
+      lastWatchCompileJobIdRef.current = payload.last_compile_job_id ?? "";
+      if (payload.last_compile_job_id) {
+        await loadJob(payload.last_compile_job_id, workspaceRef);
+      }
+    }
+
+    if (hasMeaningfulWatchChange(previous, payload)) {
+      await loadOverview();
+      if (selectedWorkspace === workspaceRef) {
+        await loadDocuments(workspaceRef);
+      }
+    }
+
+    return payload;
+  };
+
+  const loadWatchBacklog = async (
+    workspaceRef: string,
+    preserveSelection: boolean = false,
+  ): Promise<WatchBacklogItem[]> => {
+    if (!workspaceRef) {
+      setWatchBacklogItems([]);
+      setSelectedBacklogPaths([]);
+      setWatchBacklogError("");
+      return [];
+    }
+
+    const response = await fetch(
+      `${apiBase}/workspaces/${encodeURIComponent(workspaceRef)}/watch/backlog`,
+    );
+    if (!response.ok) {
+      throw new Error(`watch backlog failed: ${response.status}`);
+    }
+
+    const payload = (await response.json()) as WatchBacklogResponse;
+    setWatchBacklogItems(payload.items);
+    setWatchBacklogError("");
+    if (preserveSelection) {
+      setSelectedBacklogPaths((current) =>
+        current.filter((path) => payload.items.some((item) => item.path === path)),
+      );
+    } else {
+      setSelectedBacklogPaths(payload.items.map((item) => item.path));
+    }
+    return payload.items;
+  };
+
+  useEffect(() => {
+    if (!selectedWorkspace) {
+      watchStatusRef.current = null;
+      lastWatchCompileJobIdRef.current = "";
+      setWatchStatus(null);
+      setWatchPollError("");
+      setWatchBacklogItems([]);
+      setWatchBacklogError("");
+      setSelectedBacklogPaths([]);
+      setWatchAutoCompile(true);
+      setWatchDebounceSeconds("2.0");
+      return;
+    }
+    watchStatusRef.current = null;
+    lastWatchCompileJobIdRef.current = "";
+    void loadDocuments(selectedWorkspace);
+    void loadCredentialStatus(selectedWorkspace);
+    void loadWatchStatus(selectedWorkspace, true).catch((cause) => {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setWatchPollError(message);
+    });
+    void loadWatchBacklog(selectedWorkspace).catch((cause) => {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setWatchBacklogError(message);
+    });
+  }, [apiBase, selectedWorkspace]);
+
   useEffect(() => {
     if (!selectedWorkspace) {
       return;
     }
-    void loadDocuments(selectedWorkspace);
-    void loadCredentialStatus(selectedWorkspace);
+
+    let cancelled = false;
+    let timeoutId = 0;
+
+    const poll = async () => {
+      try {
+        await loadWatchStatus(selectedWorkspace);
+      } catch (cause) {
+        if (cancelled) {
+          return;
+        }
+        const message = cause instanceof Error ? cause.message : String(cause);
+        setWatchPollError(message);
+      }
+
+      if (!cancelled) {
+        timeoutId = window.setTimeout(() => {
+          void poll();
+        }, watchPollIntervalMs);
+      }
+    };
+
+    timeoutId = window.setTimeout(() => {
+      void poll();
+    }, watchPollIntervalMs);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
   }, [apiBase, selectedWorkspace]);
 
   useEffect(() => {
@@ -620,6 +828,146 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
     }
   };
 
+  const onSaveWatch = async () => {
+    if (!selectedWorkspace) {
+      return;
+    }
+
+    const debounce = Number.parseFloat(watchDebounceSeconds);
+    if (!Number.isFinite(debounce) || debounce <= 0) {
+      setError("watch debounce must be a positive number");
+      return;
+    }
+
+    const request: WatchRequest = {
+      auto_compile: watchAutoCompile,
+      debounce_seconds: debounce,
+    };
+
+    setBusy(true);
+    setError("");
+    setActionInfo("");
+    try {
+      const response = await fetch(
+        `${apiBase}/workspaces/${encodeURIComponent(selectedWorkspace)}/watch`,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(request),
+        },
+      );
+      if (!response.ok) {
+        if (response.status === 400) {
+          const payload = (await response.json()) as { detail?: { message?: string } };
+          throw new Error(payload.detail?.message ?? `save watch failed: ${response.status}`);
+        }
+        throw new Error(`save watch failed: ${response.status}`);
+      }
+      const payload = (await response.json()) as WatchStatus;
+      watchStatusRef.current = payload;
+      lastWatchCompileJobIdRef.current = payload.last_compile_job_id ?? "";
+      setWatchStatus(payload);
+      setWatchAutoCompile(payload.auto_compile);
+      setWatchDebounceSeconds(String(payload.debounce_seconds));
+      setWatchPollError("");
+      setActionInfo(`watch enabled: ${payload.paths[0] ?? "workspace/raw"}`);
+      await loadWatchBacklog(selectedWorkspace, true);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onStopWatch = async () => {
+    if (!selectedWorkspace) {
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    setActionInfo("");
+    try {
+      const response = await fetch(
+        `${apiBase}/workspaces/${encodeURIComponent(selectedWorkspace)}/watch`,
+        {
+          method: "DELETE",
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`stop watch failed: ${response.status}`);
+      }
+      const payload = (await response.json()) as WatchStatus;
+      watchStatusRef.current = payload;
+      setWatchStatus(payload);
+      setWatchPollError("");
+      setActionInfo("watch stopped");
+      await loadWatchBacklog(selectedWorkspace, true);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onToggleBacklogPath = (path: string) => {
+    setSelectedBacklogPaths((current) =>
+      current.includes(path)
+        ? current.filter((item) => item !== path)
+        : [...current, path],
+    );
+  };
+
+  const onIngestBacklogSelected = async () => {
+    if (!selectedWorkspace || selectedBacklogPaths.length === 0) {
+      return;
+    }
+    if (!window.confirm(`Ingest ${selectedBacklogPaths.length} pending raw file(s)?`)) {
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    setActionInfo("");
+    try {
+      const response = await fetch(
+        `${apiBase}/workspaces/${encodeURIComponent(selectedWorkspace)}/watch/backlog/ingest`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ paths: selectedBacklogPaths }),
+        },
+      );
+      if (!response.ok) {
+        if (response.status === 400) {
+          const payload = (await response.json()) as { detail?: { message?: string } };
+          throw new Error(payload.detail?.message ?? `backlog ingest failed: ${response.status}`);
+        }
+        throw new Error(`backlog ingest failed: ${response.status}`);
+      }
+
+      const payload = (await response.json()) as IngestResponse;
+      setActionInfo(
+        `backlog ingest done: discovered=${payload.discovered_files}, added=${payload.added_documents.length}, skipped=${payload.skipped_files.length}, unsupported=${payload.unsupported_files.length}`,
+      );
+      await loadDocuments(selectedWorkspace);
+      await loadOverview();
+      await loadWatchStatus(selectedWorkspace);
+      await loadWatchBacklog(selectedWorkspace);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onQueueCompile = async () => {
     if (!selectedWorkspace) {
       return;
@@ -682,6 +1030,11 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
     visibleCompileJob?.status !== "failed";
   const compileProvider = payloadString(visibleCompileJob?.payload, "provider");
   const compileModel = payloadString(visibleCompileJob?.payload, "model");
+  const selectedWorkspaceItem =
+    workspaces.find((workspace) => workspace.workspace_id === selectedWorkspace) ?? null;
+  const watchRootPath =
+    watchStatus?.paths[0] ??
+    (selectedWorkspaceItem ? `${selectedWorkspaceItem.root_path}/raw` : "");
 
   return (
     <UIProvider>
@@ -836,6 +1189,260 @@ export function AppShell({ pickImportPaths }: AppShellProps = {}) {
                 </Button>
               </div>
             ) : null}
+
+            <section
+              style={{
+                border: "1px solid #d7dce3",
+                borderRadius: 12,
+                padding: 12,
+                display: "grid",
+                gap: 10,
+                background: "rgba(244, 249, 255, 0.72)",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  gap: 10,
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "grid", gap: 4 }}>
+                  <strong>Watch Raw Folder</strong>
+                  <small>
+                    Watch mode is fixed to <code>workspace/raw</code>. Copy or move files into this folder to auto-ingest them.
+                  </small>
+                </div>
+                <span
+                  style={{
+                    ...statusBadgeStyle(watchStatus?.enabled ? "running" : "idle"),
+                    padding: "4px 8px",
+                    borderRadius: 99,
+                    fontWeight: 700,
+                  }}
+                >
+                  {watchStatus?.enabled ? "watching" : "stopped"}
+                </span>
+              </div>
+
+              <div
+                style={{
+                  border: "1px solid #d7dce3",
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  background: "rgba(255, 255, 255, 0.85)",
+                }}
+              >
+                <small>watched path</small>
+                <div>
+                  <code>{watchRootPath || "-"}</code>
+                </div>
+              </div>
+
+              <section
+                style={{
+                  border: "1px solid #d7dce3",
+                  borderRadius: 10,
+                  padding: 12,
+                  display: "grid",
+                  gap: 10,
+                  background: "rgba(255, 255, 255, 0.85)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 10,
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <div style={{ display: "grid", gap: 4 }}>
+                    <strong>Pending Raw Files</strong>
+                    <small>
+                      Files already present in <code>workspace/raw</code> need your confirmation before ingest.
+                    </small>
+                  </div>
+                  <span
+                    style={{
+                      padding: "4px 8px",
+                      borderRadius: 99,
+                      background: watchBacklogItems.length > 0 ? "#fff2d6" : "#eef2f6",
+                      color: watchBacklogItems.length > 0 ? "#8a5a13" : "#4f6478",
+                      fontWeight: 700,
+                    }}
+                  >
+                    {watchBacklogItems.length} pending
+                  </span>
+                </div>
+
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={busy || !selectedWorkspace}
+                    onClick={() => {
+                      void loadWatchBacklog(selectedWorkspace, true).catch((cause) => {
+                        const message = cause instanceof Error ? cause.message : String(cause);
+                        setWatchBacklogError(message);
+                      });
+                    }}
+                  >
+                    Refresh Pending Files
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={busy || watchBacklogItems.length === 0}
+                    onClick={() => {
+                      setSelectedBacklogPaths(watchBacklogItems.map((item) => item.path));
+                    }}
+                  >
+                    Select All
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={busy || selectedBacklogPaths.length === 0}
+                    onClick={() => {
+                      setSelectedBacklogPaths([]);
+                    }}
+                  >
+                    Clear Selection
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={busy || selectedBacklogPaths.length === 0}
+                    onClick={() => {
+                      void onIngestBacklogSelected();
+                    }}
+                  >
+                    Ingest Selected
+                  </Button>
+                </div>
+
+                {watchBacklogItems.length === 0 ? (
+                  <small>No pending raw files awaiting confirmation.</small>
+                ) : (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {watchBacklogItems.map((item) => {
+                      const checked = selectedBacklogPaths.includes(item.path);
+                      return (
+                        <label
+                          key={item.path}
+                          style={{
+                            display: "grid",
+                            gap: 4,
+                            border: "1px solid #d7dce3",
+                            borderRadius: 10,
+                            padding: "10px 12px",
+                          }}
+                        >
+                          <span style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => {
+                                onToggleBacklogPath(item.path);
+                              }}
+                              disabled={busy}
+                            />
+                            <strong>{item.name}</strong>
+                            <small>
+                              {item.size_bytes.toLocaleString()} bytes, updated {formatTimestamp(item.modified_at)}
+                            </small>
+                          </span>
+                          <code>{item.path}</code>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {watchBacklogError ? (
+                  <small style={{ color: "#a66d1f" }}>
+                    backlog refresh failed: <code>{watchBacklogError}</code>
+                  </small>
+                ) : null}
+              </section>
+
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <Button
+                  type="button"
+                  disabled={busy || !selectedWorkspace}
+                  onClick={() => {
+                    void onSaveWatch();
+                  }}
+                >
+                  {watchStatus?.enabled ? "Update Watch" : "Start Watching"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={busy || !selectedWorkspace || !watchStatus?.enabled}
+                  onClick={() => {
+                    void onStopWatch();
+                  }}
+                >
+                  Stop Watching
+                </Button>
+              </div>
+
+              <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={watchAutoCompile}
+                    onChange={(event) => setWatchAutoCompile(event.target.checked)}
+                    disabled={busy || !selectedWorkspace}
+                  />
+                  <span>Auto-compile</span>
+                </label>
+
+                <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <span>Debounce (s)</span>
+                  <input
+                    value={watchDebounceSeconds}
+                    onChange={(event) => setWatchDebounceSeconds(event.target.value)}
+                    inputMode="decimal"
+                    style={{
+                      width: 90,
+                      border: "1px solid #ccd5df",
+                      borderRadius: 10,
+                      padding: "8px 10px",
+                    }}
+                  />
+                </label>
+              </div>
+
+              <div style={{ display: "grid", gap: 4 }}>
+                <small>
+                  root: <code>{watchRootPath || "-"}</code>
+                </small>
+                <small>
+                  pending paths: <code>{watchStatus?.pending_paths ?? 0}</code>, auto-compile: <code>{watchStatus?.auto_compile ? "on" : "off"}</code>
+                </small>
+                <small>
+                  last ingest job: <code>{watchStatus?.last_ingest_job_id ?? "-"}</code>, last compile job: <code>{watchStatus?.last_compile_job_id ?? "-"}</code>
+                </small>
+                <small>
+                  active compile: <code>{watchStatus?.active_compile_job_id ?? "-"}</code>, updated: <code>{formatTimestamp(watchStatus?.updated_at)}</code>
+                </small>
+                {watchStatus?.last_error ? (
+                  <small style={{ color: "#a6332b" }}>
+                    watch error: <code>{watchStatus.last_error}</code>
+                  </small>
+                ) : null}
+                {watchPollError ? (
+                  <small style={{ color: "#a66d1f" }}>
+                    watch poll retrying after error: <code>{watchPollError}</code>
+                  </small>
+                ) : null}
+              </div>
+            </section>
 
             <form onSubmit={onSaveCredentials} style={{ display: "grid", gap: 8 }}>
               <div style={{ display: "grid", gap: 8, gridTemplateColumns: "180px 1fr 1fr" }}>
