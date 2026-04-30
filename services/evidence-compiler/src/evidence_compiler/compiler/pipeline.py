@@ -93,46 +93,157 @@ class _MaterializedDocument:
 
 
 class SummaryStageResult(BaseModel):
-    document_brief: str = Field(min_length=1, max_length=220)
-    summary_markdown: str = Field(min_length=1)
+    """Structured summary payload for one source document."""
+
+    document_brief: str = Field(
+        min_length=1,
+        max_length=220,
+        description=(
+            "Write one concise sentence describing the source document for summary "
+            "frontmatter and downstream planner context."
+        ),
+    )
+
+    summary_markdown: str = Field(
+        min_length=1,
+        description=(
+            "The full summary in Markdown. Include key concepts, findings, ideas."
+        ),
+    )
 
 
 class PagePlanItem(BaseModel):
-    slug: str
-    title: str
-    brief: str = ""
-    candidate_evidence_ids: list[str] = Field(default_factory=list)
+    """Planner-proposed create or update target for one taxonomy page."""
+
+    slug: str = Field(
+        description=(
+            "Use the canonical wiki page slug for this target. Return lowercase "
+            "kebab-case without any folder prefix."
+        )
+    )
+    title: str = Field(description="Write the reader-facing title for this wiki page.")
+    brief: str = Field(
+        default="",
+        description=(
+            "Write one short sentence under 180 characters summarizing what the page "
+            "covers. Return an empty string when no concise brief is justified."
+        ),
+    )
+    candidate_evidence_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List verified evidence ids that directly support this page. Use only ids "
+            "provided in context and return [] when none apply."
+        ),
+    )
 
 
 class PagePlanActions(BaseModel):
-    create: list[PagePlanItem] = Field(default_factory=list)
-    update: list[PagePlanItem] = Field(default_factory=list)
-    related: list[str] = Field(default_factory=list)
+    """Planner actions for one taxonomy bucket."""
+
+    create: list[PagePlanItem] = Field(
+        default_factory=list,
+        description="Pages that should be created as new wiki entries in this bucket.",
+    )
+    update: list[PagePlanItem] = Field(
+        default_factory=list,
+        description=(
+            "Existing wiki pages that should be updated instead of recreated."
+        ),
+    )
+    related: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Existing page slugs related to this document but not requiring create or "
+            "update work."
+        ),
+    )
 
 
 class EvidencePlanItem(BaseModel):
-    page_slug: str = ""
-    claim: str
-    title: str
-    brief: str = ""
+    """Claim-centric evidence page plan item."""
+
+    page_slug: str = Field(
+        default="",
+        description=(
+            "Use the canonical evidence page slug for this claim page. Return "
+            "lowercase kebab-case without any folder prefix."
+        ),
+    )
+    claim: str = Field(
+        description="State the canonical claim this evidence page should support."
+    )
+    title: str = Field(
+        description="Write the reader-facing title for the evidence page."
+    )
+    brief: str = Field(
+        default="",
+        description=(
+            "Write one short sentence under 180 characters summarizing the claim. "
+            "Return an empty string when no concise brief is justified."
+        ),
+    )
 
 
 class EvidencePlanActions(BaseModel):
-    create: list[EvidencePlanItem] = Field(default_factory=list)
-    update: list[EvidencePlanItem] = Field(default_factory=list)
+    """Planner actions for claim-centric evidence pages."""
+
+    create: list[EvidencePlanItem] = Field(
+        default_factory=list,
+        description="Evidence pages that should be created as new claim records.",
+    )
+    update: list[EvidencePlanItem] = Field(
+        default_factory=list,
+        description="Existing evidence pages that should be updated for this compile.",
+    )
 
 
 class EvidenceDraftQuote(BaseModel):
-    quote: str
-    anchor: str
-    page_ref: str = ""
+    """One verbatim quote candidate for an evidence page."""
+
+    quote: str = Field(
+        description=(
+            "Copy a verbatim supporting quote from the source text. Do not paraphrase "
+            "or invent wording."
+        )
+    )
+    anchor: str = Field(
+        description=(
+            "Name the closest source heading, section label, or page marker that helps "
+            "a reviewer locate the quote."
+        )
+    )
+    page_ref: str = Field(
+        default="",
+        description=(
+            "Provide the explicit page reference when the source exposes one; "
+            "otherwise return an empty string."
+        ),
+    )
 
 
 class EvidenceDraftOutput(BaseModel):
-    claim: str
-    title: str
-    brief: str
-    quotes: list[EvidenceDraftQuote] = Field(default_factory=list)
+    """Structured quote draft for one evidence page."""
+
+    claim: str = Field(
+        description="Carry forward the canonical claim for the evidence page being drafted."
+    )
+    title: str = Field(
+        description="Carry forward the reader-facing title for the evidence page."
+    )
+    brief: str = Field(
+        description=(
+            "Carry forward a concise one-sentence brief for the evidence page under "
+            "180 characters."
+        )
+    )
+    quotes: list[EvidenceDraftQuote] = Field(
+        default_factory=list,
+        description=(
+            "Provide verbatim supporting quote records for this claim. Return [] when "
+            "no reliable quote can be extracted."
+        ),
+    )
 
 
 class EvidenceValidationIssue(BaseModel):
@@ -170,47 +281,202 @@ class EvidenceDocumentManifest(BaseModel):
 
 
 class TaxonomyPlanResult(BaseModel):
-    topics: PagePlanActions = Field(default_factory=PagePlanActions)
-    regulations: PagePlanActions = Field(default_factory=PagePlanActions)
-    procedures: PagePlanActions = Field(default_factory=PagePlanActions)
-    conflicts: PagePlanActions = Field(default_factory=PagePlanActions)
+    """Structured taxonomy planning output grouped by page type."""
+
+    topics: PagePlanActions = Field(
+        default_factory=PagePlanActions,
+        description=(
+            "Topic page create, update, and related actions for stable descriptive "
+            "subjects."
+        ),
+    )
+    regulations: PagePlanActions = Field(
+        default_factory=PagePlanActions,
+        description=(
+            "Regulation page create, update, and related actions for normative rules "
+            "or restrictions."
+        ),
+    )
+    procedures: PagePlanActions = Field(
+        default_factory=PagePlanActions,
+        description=(
+            "Procedure page create, update, and related actions for explicit workflows "
+            "or operational steps."
+        ),
+    )
+    conflicts: PagePlanActions = Field(
+        default_factory=PagePlanActions,
+        description=(
+            "Conflict page create, update, and related actions for real mismatches or "
+            "disagreements."
+        ),
+    )
 
 
 class TopicPageOutput(BaseModel):
-    title: str
-    brief: str
-    context_markdown: str
-    used_evidence_ids: list[str] = Field(default_factory=list)
+    """Drafted content for a topic wiki page."""
+
+    title: str = Field(
+        description=(
+            "Use the target topic title unless the source clearly supports a better "
+            "canonical name."
+        )
+    )
+    brief: str = Field(
+        description=(
+            "Write one concise sentence under 180 characters defining the stable "
+            "subject of the page."
+        )
+    )
+    context_markdown: str = Field(
+        description=(
+            "Write the topic body as multiline markdown that explains scope, key "
+            "facts, and durable context. Do not include YAML frontmatter or a top-level "
+            "# heading."
+        )
+    )
+    used_evidence_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List candidate evidence ids actually relied on in the drafted page. "
+            "Return [] when none were used."
+        ),
+    )
 
 
 class RegulationPageOutput(BaseModel):
-    title: str
-    brief: str
-    requirement_markdown: str
-    applicability_markdown: str
-    authority_markdown: str
-    used_evidence_ids: list[str] = Field(default_factory=list)
+    """Drafted content for a regulation wiki page."""
+
+    title: str = Field(
+        description=(
+            "Use the target regulation title unless the source clearly supports a "
+            "better canonical rule name."
+        )
+    )
+    brief: str = Field(
+        description=(
+            "Write one concise sentence under 180 characters summarizing the binding "
+            "rule or restriction."
+        )
+    )
+    requirement_markdown: str = Field(
+        description=(
+            "Write the normative requirement itself as multiline markdown. Do not turn "
+            "this field into procedural steps or YAML frontmatter."
+        )
+    )
+    applicability_markdown: str = Field(
+        description=(
+            "Write multiline markdown explaining who, when, or what contexts trigger "
+            "the rule, including explicit exceptions when present."
+        )
+    )
+    authority_markdown: str = Field(
+        description=(
+            "Write multiline markdown covering authority, provenance, caveats, or "
+            "guideline basis for the rule."
+        )
+    )
+    used_evidence_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List candidate evidence ids actually relied on in the drafted page. "
+            "Return [] when none were used."
+        ),
+    )
 
 
 class ProcedurePageOutput(BaseModel):
-    title: str
-    brief: str
-    steps: list[str] = Field(default_factory=list)
-    used_evidence_ids: list[str] = Field(default_factory=list)
+    """Drafted content for a procedure wiki page."""
+
+    title: str = Field(
+        description=(
+            "Use the target procedure title unless the source clearly supports a "
+            "better canonical workflow name."
+        )
+    )
+    brief: str = Field(
+        description=(
+            "Write one concise sentence under 180 characters summarizing the workflow "
+            "outcome."
+        )
+    )
+    steps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Return 3-7 concise imperative step strings in execution order. Do not "
+            "embed numbering, bullets, or markdown formatting inside the strings."
+        ),
+    )
+    used_evidence_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List candidate evidence ids actually relied on in the drafted page. "
+            "Return [] when none were used."
+        ),
+    )
 
 
 class ConflictPageOutput(BaseModel):
-    title: str
-    brief: str
-    description_markdown: str
-    impacted_pages: list[str] = Field(default_factory=list)
-    used_evidence_ids: list[str] = Field(default_factory=list)
+    """Drafted content for a conflict wiki page."""
+
+    title: str = Field(
+        description=(
+            "Use the target conflict title unless the source clearly supports a better "
+            "canonical mismatch name."
+        )
+    )
+    brief: str = Field(
+        description=(
+            "Write one concise sentence under 180 characters summarizing the mismatch."
+        )
+    )
+    description_markdown: str = Field(
+        description=(
+            "Write the conflict body as multiline markdown naming the conflicting "
+            "positions, context, and consequence. Do not include YAML frontmatter or a "
+            "top-level # heading."
+        )
+    )
+    impacted_pages: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List explicit wiki links such as [[regulations/foo]] only when they are "
+            "supported by context; otherwise return []."
+        ),
+    )
+    used_evidence_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List candidate evidence ids actually relied on in the drafted page. "
+            "Return [] when none were used."
+        ),
+    )
 
 
 class ConflictCheckResult(BaseModel):
-    is_conflict: bool
-    title: str = ""
-    description: str = ""
+    """Structured decision about whether two compliance pages truly conflict."""
+
+    is_conflict: bool = Field(
+        description=(
+            "Return true only when the two pages contain a real conflict or opposing "
+            "requirement."
+        )
+    )
+    title: str = Field(
+        default="",
+        description=(
+            "If is_conflict is true, write a concise conflict title; otherwise return "
+            "an empty string."
+        ),
+    )
+    description: str = Field(
+        default="",
+        description=(
+            "If is_conflict is true, briefly describe the mismatch and why it matters; "
+            "otherwise return an empty string."
+        ),
+    )
 
 
 @dataclass
@@ -256,7 +522,7 @@ _DRAFT_CONCURRENCY = 5
 _MARKDOWN_LINE_WIDTH = 88
 _SUMMARY_MAX_TOKENS = 2048
 _EVIDENCE_PLAN_MAX_TOKENS = 2048
-_TAXONOMY_PLAN_MAX_TOKENS = 1536
+_TAXONOMY_PLAN_MAX_TOKENS = 5120
 _EVIDENCE_DRAFT_MAX_TOKENS = 1536
 _PLAN_PREVIEW_LIMIT = 10
 
@@ -1187,16 +1453,8 @@ def _downstream_messages(
 
 def _summary_messages(doc_name: str, text: str, language: str) -> list[dict[str, str]]:
     markdown_rules = (
-        "Markdown body rules:\n"
-        "- No YAML frontmatter.\n"
-        "- summary_markdown must be a multiline markdown body string; encode line breaks as \\n inside the JSON string.\n"
-        # "- Keep summary_markdown concise: focus on the highest-signal sections and avoid exhaustive subsection lists.\n"
-        "- Do not include any # top-level heading in summary_markdown; start sections at ## and subsections at ###.\n"
-        # "- Put each heading, paragraph, and list item on its own line.\n"
-        # "- Headings must stand alone on their own line with body text starting below them.\n"
-        # "- Leave a blank line between paragraphs and sections.\n"
-        # "- Prefer paragraphs and bullets over tables.\n"
-        # "- Do not place heading plus prose, heading plus heading, or multiple list items on the same line.\n\n"
+        "Markdown body rules:\n- No YAML frontmatter.\n"
+        # "- Do not include the top-level page title heading.\n"
     )
     return [
         {
@@ -1214,10 +1472,8 @@ def _summary_messages(doc_name: str, text: str, language: str) -> list[dict[str,
         {
             "role": "user",
             "content": (
-                "Summarize the document above.\n"
-                "Return:\n"
-                "- document_brief: one sentence, aim for <= 180 characters\n"
-                "- summary_markdown: multiline markdown body for a wiki summary page\n\n"
+                # "Summarize the document above.\n"
+                "Write a summary page for the document above in Markdown. \n"
                 f"{markdown_rules}"
             ),
         },
@@ -1239,7 +1495,7 @@ def _summarize_document(
             language=language,
         ),
         response_model=SummaryStageResult,
-        max_tokens=_SUMMARY_MAX_TOKENS,
+        # max_tokens=_SUMMARY_MAX_TOKENS,
         usage_callback=usage_callback,
     )
     summary.summary_markdown = _normalize_summary_markdown(summary.summary_markdown)
@@ -2810,7 +3066,7 @@ def _write_summary_page(
         "brief": summary.document_brief,
     }
     body = (
-        f"# Summary: {materialized.document.name}\n\n"
+        # f"# Summary: {materialized.document.name}\n\n"
         f"{_normalize_summary_markdown(summary.summary_markdown)}\n"
     )
     # Create an empty Derived Pages section now so later backlink steps can safely

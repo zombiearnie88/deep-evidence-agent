@@ -1,5 +1,3 @@
-"""Compilation pipelines and orchestration."""
-
 """Compilation pipeline exports."""
 
 from evidence_compiler.compiler.pipeline import (

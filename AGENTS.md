@@ -71,6 +71,11 @@ This file stores persistent implementation conventions for future coding session
 - Keep a small helper for safely extracting message content from LiteLLM responses
   to satisfy static typing (for example, when the response may be typed as
   `CustomStreamWrapper` by type checkers).
+- Structured compiler response schemas should include a concise class docstring and
+  meaningful `Field(description=...)` for every field, including nested structured
+  models used inside the response.
+- Schema descriptions should explain semantic meaning and formatting constraints,
+  not restate the Python type.
 - DeepAgent may support QA, lint, or review workflows around compile, but it is
   not the primary Milestone 2 compile artifact writer.
 
@@ -110,3 +115,6 @@ This file stores persistent implementation conventions for future coding session
 - `2026-04-29`: Non-obvious helper functions across the repo should carry short,
   review-oriented comments or docstrings when that materially improves
   readability, while still avoiding commentary on obvious code.
+- `2026-04-30`: Structured compiler response schemas should keep concise class
+  docstrings plus meaningful `Field(description=...)` entries on every field,
+  including nested response models.

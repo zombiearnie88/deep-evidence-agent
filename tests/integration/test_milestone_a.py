@@ -404,10 +404,9 @@ class MarkdownRenderFormattingTest(unittest.TestCase):
         )
 
         prompt = messages[-1]["content"]
-        self.assertIn("encode line breaks as \\n inside the JSON string", prompt)
-        self.assertIn("Keep summary_markdown concise", prompt)
-        self.assertIn("Do not include any # top-level heading", prompt)
-        self.assertIn("Do not place heading plus prose", prompt)
+        self.assertIn("summary_markdown: markdown body for a wiki summary page", prompt)
+        self.assertIn("No YAML frontmatter", prompt)
+        self.assertIn("Do not include the top-level page title heading", prompt)
 
 
 class TaxonomyPlannerPostprocessTest(unittest.TestCase):
@@ -937,6 +936,164 @@ class StructuredCompletionWrapperTest(unittest.TestCase):
                 )
 
         self.assertEqual(completion.call_count, 2)
+
+
+class StructuredAsyncWrapperTest(unittest.IsolatedAsyncioTestCase):
+    """Validate async routing and draft wrapper call contracts."""
+
+    def _materialized(self) -> compiler_pipeline._MaterializedDocument:
+        document = compiler_pipeline.DocumentRecord(
+            doc_id="doc-1",
+            name="policy.md",
+            file_hash="hash-1",
+            file_type="md",
+            raw_path=Path("/tmp/source.md"),
+            source_path=Path("/tmp/wiki/source/source.md"),
+            is_long_doc=False,
+            requires_pageindex=False,
+            page_count=None,
+            status="ready",
+            created_at="2026-04-24T00:00:00Z",
+        )
+        return compiler_pipeline._MaterializedDocument(
+            document=document,
+            summary_slug="policy-summary",
+            source_ref="wiki/sources/policy.md",
+            text_for_summary="# Policy\n\nVerify each dose before release.\n",
+            text_for_downstream="# Policy\n\nVerify each dose before release.\n",
+            downstream_source_ref="wiki/sources/policy.md",
+        )
+
+    def _summary(self) -> compiler_pipeline.SummaryStageResult:
+        return compiler_pipeline.SummaryStageResult(
+            document_brief="Dose verification policy.",
+            summary_markdown="## Overview\nVerify each dose before release.",
+        )
+
+    def _item(self) -> compiler_pipeline.PagePlanItem:
+        return compiler_pipeline.PagePlanItem(
+            slug="dose-verification",
+            title="Dose Verification",
+            brief="Verify each dose before release.",
+            candidate_evidence_ids=["evidence:doc-1:claim-1"],
+        )
+
+    async def test_page_draft_paths_do_not_pass_max_tokens(self) -> None:
+        """Taxonomy page draft helpers should stay uncapped in phase 1."""
+        materialized = self._materialized()
+        summary = self._summary()
+        item = self._item()
+        draft_cases = [
+            (
+                compiler_pipeline._draft_topic_page,
+                compiler_pipeline.TopicPageOutput(
+                    title="Dose Verification",
+                    brief="Verify each dose before release.",
+                    context_markdown="Dose verification context.",
+                    used_evidence_ids=[],
+                ),
+            ),
+            (
+                compiler_pipeline._draft_regulation_page,
+                compiler_pipeline.RegulationPageOutput(
+                    title="Dose Verification Rule",
+                    brief="Verify each dose before release.",
+                    requirement_markdown="Verify each dose before release.",
+                    applicability_markdown="Applies to dispensing workflows.",
+                    authority_markdown="Derived from the source summary.",
+                    used_evidence_ids=[],
+                ),
+            ),
+            (
+                compiler_pipeline._draft_procedure_page,
+                compiler_pipeline.ProcedurePageOutput(
+                    title="Dose Verification Flow",
+                    brief="Verify each dose before release.",
+                    steps=["Verify the dose before release."],
+                    used_evidence_ids=[],
+                ),
+            ),
+            (
+                compiler_pipeline._draft_conflict_page,
+                compiler_pipeline.ConflictPageOutput(
+                    title="Dose Verification Conflict",
+                    brief="Potential verification mismatch.",
+                    description_markdown="Potential verification mismatch.",
+                    impacted_pages=[],
+                    used_evidence_ids=[],
+                ),
+            ),
+        ]
+
+        for draft_fn, response in draft_cases:
+            with self.subTest(draft_fn=draft_fn.__name__):
+                with patch(
+                    "evidence_compiler.compiler.pipeline._structured_acompletion",
+                    return_value=response,
+                ) as structured_acompletion:
+                    await draft_fn(
+                        model="gpt-5.4-mini",
+                        language="English",
+                        materialized=materialized,
+                        summary=summary,
+                        item=item,
+                        evidence_pack=[],
+                        is_update=False,
+                        existing_body="",
+                    )
+
+                self.assertIsNone(
+                    structured_acompletion.call_args.kwargs.get("max_tokens")
+                )
+
+
+class StructuredSchemaDescriptionTest(unittest.TestCase):
+    """Ensure structured response schemas carry field descriptions."""
+
+    def _assert_schema_descriptions(self, model: type[compiler_pipeline.BaseModel]) -> None:
+        schema = model.model_json_schema()
+        definitions = schema.get("$defs", {})
+        objects: list[tuple[str, object]] = [(model.__name__, schema)]
+        objects.extend(
+            (name, definition) for name, definition in definitions.items()
+        )
+
+        for schema_name, definition in objects:
+            if not isinstance(definition, dict):
+                continue
+            properties = definition.get("properties")
+            if not isinstance(properties, dict):
+                continue
+            for field_name, field_schema in properties.items():
+                if not isinstance(field_schema, dict):
+                    continue
+                description = str(field_schema.get("description") or "").strip()
+                self.assertTrue(
+                    description,
+                    msg=f"Missing description for {schema_name}.{field_name}",
+                )
+
+    def test_structured_schemas_expose_field_descriptions(self) -> None:
+        """Every structured response schema field should describe its semantic meaning."""
+        models = [
+            compiler_pipeline.SummaryStageResult,
+            compiler_pipeline.PagePlanItem,
+            compiler_pipeline.PagePlanActions,
+            compiler_pipeline.EvidencePlanItem,
+            compiler_pipeline.EvidencePlanActions,
+            compiler_pipeline.EvidenceDraftQuote,
+            compiler_pipeline.EvidenceDraftOutput,
+            compiler_pipeline.TaxonomyPlanResult,
+            compiler_pipeline.TopicPageOutput,
+            compiler_pipeline.RegulationPageOutput,
+            compiler_pipeline.ProcedurePageOutput,
+            compiler_pipeline.ConflictPageOutput,
+            compiler_pipeline.ConflictCheckResult,
+        ]
+
+        for model in models:
+            with self.subTest(model=model.__name__):
+                self._assert_schema_descriptions(model)
 
 
 class EvidenceVerificationTest(unittest.TestCase):
