@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -11,6 +14,7 @@ from evidence_compiler.compiler import compile_documents, rebuild_index
 from evidence_compiler.config import DEFAULT_CONFIG, load_config, save_config
 from evidence_compiler.converter import SUPPORTED_EXTENSIONS, convert_document
 from evidence_compiler.credentials import (
+    delete_workspace_credentials,
     get_workspace_credential_status,
     resolve_workspace_credentials,
     save_workspace_credentials,
@@ -22,9 +26,12 @@ from evidence_compiler.models import (
     CompilePlanSummary,
     CompileProgressDetails,
     CompileResult,
+    CompilePlanPreviewResult,
+    ConfigSnapshot,
     CredentialStatus,
     DocumentRecord,
     JobRecord,
+    JobsResponse,
     ProviderOption,
     StageCounter,
     TokenUsageSummary,
@@ -432,6 +439,24 @@ def get_credentials_status(workspace: Path) -> CredentialStatus:
     return get_workspace_credential_status(workspace)
 
 
+def delete_credentials(workspace: Path) -> CredentialStatus:
+    """Delete the current workspace credential bundle.
+
+    Args:
+        workspace: Initialized workspace root.
+
+    Returns:
+        Updated credential status after deletion.
+
+    Raises:
+        ValueError: If workspace is not initialized.
+    """
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    delete_workspace_credentials(workspace)
+    return get_workspace_credential_status(workspace)
+
+
 def set_workspace_credentials(
     workspace: Path,
     *,
@@ -526,6 +551,165 @@ def get_status(workspace: Path) -> WorkspaceStatus:
         conflict_pages=conflict_pages,
         credentials_ready=credential_status.has_api_key,
     )
+
+
+def list_jobs(workspace: Path) -> JobsResponse:
+    """List persisted job records for one workspace.
+
+    Args:
+        workspace: Initialized workspace root.
+
+    Returns:
+        Workspace-scoped job list sorted by creation timestamp.
+
+    Raises:
+        ValueError: If workspace is not initialized.
+    """
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    jobs = JobStore(workspace / ".brain" / "jobs").list_jobs()
+    return JobsResponse(workspace=workspace, items=jobs)
+
+
+def get_job(workspace: Path, job_id: str) -> JobRecord:
+    """Return one persisted job record by id.
+
+    Args:
+        workspace: Initialized workspace root.
+        job_id: Job identifier to load from `.brain/jobs`.
+
+    Returns:
+        Parsed job record.
+
+    Raises:
+        ValueError: If workspace is not initialized.
+        FileNotFoundError: If the requested job file does not exist.
+    """
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    return JobStore(workspace / ".brain" / "jobs").read(job_id)
+
+
+def wait_for_job(
+    workspace: Path,
+    job_id: str,
+    *,
+    timeout_seconds: float | None = None,
+    interval_seconds: float = 0.2,
+) -> JobRecord:
+    """Poll a workspace job until it reaches a terminal state.
+
+    Args:
+        workspace: Initialized workspace root.
+        job_id: Job identifier to poll.
+        timeout_seconds: Optional timeout budget before raising `TimeoutError`.
+        interval_seconds: Polling interval between reads.
+
+    Returns:
+        Final job record once status becomes `completed` or `failed`.
+
+    Raises:
+        ValueError: If workspace is not initialized.
+        FileNotFoundError: If the requested job file does not exist.
+        TimeoutError: If the job does not finish before the timeout budget.
+    """
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    while True:
+        job = JobStore(workspace / ".brain" / "jobs").read(job_id)
+        if job.status in {"completed", "failed"}:
+            return job
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for job: {job_id}")
+        time.sleep(interval_seconds)
+
+
+def get_config_snapshot(workspace: Path) -> ConfigSnapshot:
+    """Return the effective compiler config for one workspace.
+
+    Args:
+        workspace: Initialized workspace root.
+
+    Returns:
+        Workspace path plus merged config values.
+
+    Raises:
+        ValueError: If workspace is not initialized.
+    """
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    values = load_config(workspace / ".brain" / "config.yaml")
+    return ConfigSnapshot(workspace=workspace, values=values)
+
+
+def set_config_value(workspace: Path, key: str, value: object) -> ConfigSnapshot:
+    """Persist one workspace-local compiler config value.
+
+    Args:
+        workspace: Initialized workspace root.
+        key: Config key to write into `.brain/config.yaml`.
+        value: Parsed scalar, list, or mapping value to persist.
+
+    Returns:
+        Updated merged config snapshot after save.
+
+    Raises:
+        ValueError: If workspace is not initialized or `key` is empty.
+    """
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    normalized_key = key.strip()
+    if not normalized_key:
+        raise ValueError("Config key cannot be empty")
+    config_path = workspace / ".brain" / "config.yaml"
+    values = load_config(config_path)
+    values[normalized_key] = value
+    save_config(config_path, values)
+    return ConfigSnapshot(workspace=workspace, values=load_config(config_path))
+
+
+def preview_compile_plan(workspace: Path) -> CompilePlanPreviewResult:
+    """Build a read-only compile preview using a temporary shadow workspace.
+
+    Args:
+        workspace: Initialized workspace root.
+
+    Returns:
+        Pending-document count plus the compile plan summary that a compile would emit.
+
+    Raises:
+        ValueError: If workspace is not initialized.
+        MissingCredentialsError: If provider/model/api-key bundle is missing for a
+            non-empty preview target set.
+    """
+    workspace = _resolve_workspace(workspace)
+    _assert_workspace_initialized(workspace)
+    target_documents = _select_compile_targets(list_documents(workspace))
+    if not target_documents:
+        return CompilePlanPreviewResult(workspace=workspace, document_count=0)
+
+    try:
+        resolve_workspace_credentials(workspace)
+    except ValueError as error:
+        raise MissingCredentialsError(str(error)) from error
+
+    with tempfile.TemporaryDirectory(prefix="evidence-compiler-plan-") as temp_dir:
+        shadow_workspace = Path(temp_dir) / workspace.name
+        shutil.copytree(workspace, shadow_workspace, dirs_exist_ok=True)
+        result = compile_workspace(shadow_workspace)
+        if result.job_id is None:
+            return CompilePlanPreviewResult(
+                workspace=workspace,
+                document_count=len(target_documents),
+            )
+        shadow_job = get_job(shadow_workspace, result.job_id)
+        plan = shadow_job.compile.plan if shadow_job.compile is not None else None
+        return CompilePlanPreviewResult(
+            workspace=workspace,
+            document_count=len(target_documents),
+            plan=plan or CompilePlanSummary(),
+        )
 
 
 def _select_compile_targets(documents: list[DocumentRecord]) -> list[DocumentRecord]:

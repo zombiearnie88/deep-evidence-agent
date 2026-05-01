@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -142,6 +143,11 @@ class JobRecord(BaseModel):
     compile: CompileProgressDetails | None = None
 
 
+class JobsResponse(BaseModel):
+    workspace: Path
+    items: list[JobRecord] = Field(default_factory=list)
+
+
 class WorkspaceStatus(BaseModel):
     workspace: Path
     indexed_documents: int
@@ -164,6 +170,12 @@ class CompileResult(BaseModel):
     job_id: str | None
 
 
+class CompilePlanPreviewResult(BaseModel):
+    workspace: Path
+    document_count: int = 0
+    plan: CompilePlanSummary = Field(default_factory=CompilePlanSummary)
+
+
 class CredentialStatus(BaseModel):
     workspace: Path
     provider: str | None
@@ -171,6 +183,11 @@ class CredentialStatus(BaseModel):
     has_api_key: bool
     validated: bool
     validated_at: str | None
+
+
+class ConfigSnapshot(BaseModel):
+    workspace: Path
+    values: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProviderOption(BaseModel):
